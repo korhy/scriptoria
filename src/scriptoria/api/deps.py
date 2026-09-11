@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 
 import httpx
+from arq.connections import ArqRedis
 from elasticsearch import AsyncElasticsearch
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,7 +32,13 @@ def get_ollama(request: Request) -> httpx.AsyncClient:
     return request.app.state.ollama
 
 
+def get_queue(request: Request) -> ArqRedis:
+    """File arq. L'API enfile, elle n'exécute jamais : l'OCR dure des minutes."""
+    return request.app.state.queue
+
+
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 EsClient = Annotated[AsyncElasticsearch, Depends(get_es)]
 OllamaClient = Annotated[httpx.AsyncClient, Depends(get_ollama)]
+TaskQueue = Annotated[ArqRedis, Depends(get_queue)]
 AppSettings = Annotated[Settings, Depends(get_settings)]

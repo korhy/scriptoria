@@ -18,7 +18,6 @@ def test_liste_documents_traverse_la_base(client: TestClient) -> None:
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/documents", {"source_filename": "page-test.png"}),
         ("/search", {"query": "facture 2019", "top_k": 3}),
         ("/search/answer", {"query": "facture 2019", "top_k": 3}),
     ],

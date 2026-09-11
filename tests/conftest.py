@@ -12,7 +12,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from scriptoria.api.deps import get_db, get_es, get_ollama
+from scriptoria.api.deps import get_db, get_es, get_ollama, get_queue
 from scriptoria.main import create_app
 
 
@@ -25,10 +25,16 @@ class FakeResult:
 
 
 class FakeSession:
-    """Session minimale : répond aux appels des tests sans base réelle."""
+    """Session minimale : répond aux appels des tests sans base réelle.
+
+    `added` permet de vérifier ce qu'un endpoint a voulu persister. Le chemin
+    nominal de l'import, lui, est couvert par les tests d'intégration : le
+    simuler fidèlement ici reviendrait à réécrire SQLAlchemy.
+    """
 
     def __init__(self, *, healthy: bool = True) -> None:
         self.healthy = healthy
+        self.added: list[Any] = []
 
     async def execute(self, *args: Any, **kwargs: Any) -> FakeResult:
         if not self.healthy:
@@ -38,11 +44,35 @@ class FakeSession:
     async def get(self, *args: Any, **kwargs: Any) -> None:
         return None
 
+    def add(self, obj: Any) -> None:
+        self.added.append(obj)
+
+    async def flush(self) -> None:
+        return None
+
+    async def refresh(self, obj: Any) -> None:
+        return None
+
     async def commit(self) -> None:
         return None
 
     async def rollback(self) -> None:
         return None
+
+
+class FakeJob:
+    job_id = "job-de-test"
+
+
+class FakeQueue:
+    """File arq simulée : enregistre ce qui a été enfilé, n'exécute rien."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def enqueue_job(self, name: str, *args: Any, **kwargs: Any) -> FakeJob:
+        self.enqueued.append((name, args))
+        return FakeJob()
 
 
 class FakeCluster:
@@ -97,6 +127,7 @@ def _build_client(app: FastAPI, **health: bool) -> TestClient:
     app.dependency_overrides[get_db] = _db
     app.dependency_overrides[get_es] = lambda: FakeEs(healthy=health.get("es", True))
     app.dependency_overrides[get_ollama] = lambda: FakeOllama(healthy=health.get("ollama", True))
+    app.dependency_overrides[get_queue] = lambda: FakeQueue()
     return TestClient(app, raise_server_exceptions=False)
 
 

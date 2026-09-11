@@ -108,7 +108,20 @@ MacBook Air M4, **16 Go unifiés**. VM Docker : **8 Go**. Ces chiffres ont des c
 
 ## 📌 État du projet et décisions en attente
 
-Le squelette tourne et les connexions sont vérifiées. **Le pipeline n'est pas implémenté** : les modules de `src/scriptoria/services/` sont des stubs typés qui figent les frontières sans préjuger de l'implémentation.
+La première moitié du pipeline tourne de bout en bout :
+
+```
+POST /documents → images écrites → job arq enfilé → worker → prétraitement → PREPROCESSED
+```
+
+**Implémenté** : import multipart (une image par page), stockage, prétraitement OpenCV, worker arq, suivi d'état et de jobs, accès aux images brutes et prétraitées.
+
+**Pas implémenté** : OCR, confiance, chunking, embeddings, indexation, recherche, UI de validation. Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
+
+Deux conventions à respecter en poursuivant :
+
+- **Le nom de fichier de l'utilisateur ne détermine jamais un chemin d'écriture.** Les chemins dérivent de l'UUID du document et du numéro de page (`services/storage.py`). C'est ce qui rend la traversée de répertoire impossible par construction plutôt que par assainissement.
+- **L'API enfile, le worker exécute.** Toute étape qui dure plus d'une seconde par page passe par arq, jamais par le cycle HTTP.
 
 **Déjà tranché :**
 

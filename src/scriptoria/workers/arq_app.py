@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 async def startup(ctx: dict[str, Any]) -> None:
     """Ouvre les clients partagés une fois pour toute la vie du worker."""
     settings = get_settings()
+    # Sans cela, les logs applicatifs du worker sont silencieusement perdus :
+    # arq configure son propre logger, pas la racine. Or c'est ici qu'on
+    # journalise l'angle de redressement de chaque page — la seule trace
+    # permettant de diagnostiquer une sortie OCR médiocre après coup.
+    logging.basicConfig(level=settings.log_level, force=True)
+
     engine = create_engine(settings)
 
     ctx["settings"] = settings

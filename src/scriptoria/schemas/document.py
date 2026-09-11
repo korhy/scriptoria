@@ -17,9 +17,3 @@ class DocumentRead(BaseModel):
     page_count: int
     created_at: datetime
     updated_at: datetime
-
-
-class DocumentCreate(BaseModel):
-    """Création par référence à un fichier déjà déposé dans `DATA_DIR/inbox`."""
-
-    source_filename: str

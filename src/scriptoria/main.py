@@ -10,6 +10,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
+from arq import create_pool
+from arq.connections import RedisSettings
 from elasticsearch import AsyncElasticsearch
 from fastapi import FastAPI
 
@@ -33,6 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         base_url=settings.ollama_base_url,
         timeout=settings.ollama_timeout_seconds,
     )
+    app.state.queue = await create_pool(RedisSettings.from_dsn(settings.redis_url))
 
     for directory in (settings.inbox_dir, settings.images_dir, settings.markdown_dir):
         directory.mkdir(parents=True, exist_ok=True)
@@ -45,6 +48,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await app.state.queue.aclose()
         await app.state.ollama.aclose()
         await app.state.es.close()
         await engine.dispose()

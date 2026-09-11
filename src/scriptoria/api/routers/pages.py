@@ -1,4 +1,8 @@
-"""Pages et révisions de transcription — surface consommée par l'UI de validation."""
+"""Révisions de transcription — surface consommée par l'UI de validation.
+
+La lecture des pages et de leurs images passe par `/documents/{id}/pages` :
+une page n'existe jamais hors d'un document, la hiérarchie le reflète.
+"""
 
 from uuid import UUID
 
@@ -11,15 +15,6 @@ router = APIRouter(prefix="/pages", tags=["pages"])
 
 @router.get("/{page_id}", status_code=status.HTTP_501_NOT_IMPLEMENTED, summary="Détail d'une page")
 async def get_page(page_id: UUID) -> None:
-    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "à implémenter avec le pipeline")
-
-
-@router.get(
-    "/{page_id}/image",
-    status_code=status.HTTP_501_NOT_IMPLEMENTED,
-    summary="Image de la page (brute ou prétraitée)",
-)
-async def get_page_image(page_id: UUID, preprocessed: bool = False) -> None:
     raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "à implémenter avec le pipeline")
 
 

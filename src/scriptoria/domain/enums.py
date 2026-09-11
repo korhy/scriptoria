@@ -12,6 +12,10 @@ class DocumentStatus(StrEnum):
 
     NEW = "new"
     PREPROCESSING = "preprocessing"
+    # Images nettoyées, en attente d'OCR. État distinct de TRANSCRIBING : tant
+    # que l'OCR n'est pas écrit, un document s'arrête ici — le dire explicitement
+    # vaut mieux que de le laisser dans un état suggérant un travail en cours.
+    PREPROCESSED = "preprocessed"
     TRANSCRIBING = "transcribing"
     AWAITING_VALIDATION = "awaiting_validation"
     VALIDATED = "validated"
