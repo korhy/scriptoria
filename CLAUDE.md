@@ -130,9 +130,25 @@ Fixture : `tests/fixtures/page-test.png`.
 
 Qualité : accents restitués, structure de tableau Markdown correcte.
 
+### Résolution : le levier de coût est réel, et il a un prix
+
+Même page, après prétraitement, deux résolutions (échantillon unique, page synthétique propre — à confirmer sur documents réels) :
+
+| `max_edge_px` | Total | Encodage image | Exactitude |
+|---|---|---|---|
+| 1600 | 51 s | 22 s | 5 champs / 5 |
+| 900 | **26 s** | 12 s | **4 champs / 5** |
+
+Diviser la résolution divise le temps par deux. **Mais l'erreur à 900 px est une corruption silencieuse** : `28,60` au lieu de `28,90`, alors que le total de ligne `173,40` reste correct. La ligne devient arithmétiquement fausse (6 × 28,60 = 171,60) sans que rien ne paraisse anormal à la lecture.
+
+**C'est le mode de défaillance à redouter sur ce projet.** Une sortie visiblement cassée se repère ; un chiffre plausible et faux se recopie dans l'archive. Deux conséquences :
+
+- Ne jamais baisser `max_edge_px` en ne mesurant que le temps — mesurer l'exactitude avec.
+- La **cohérence arithmétique** (somme des lignes vs total) est un signal de confiance **objectif** sur les documents chiffrés, bien plus fiable que le score déclaratif du modèle. À creuser dans `services/confidence.py`.
+
 **Trois conséquences sur la conception, à ne pas ignorer :**
 
-1. **L'encodage de l'image domine le coût** (37 s sur 57 s). La résolution d'entrée est donc le principal levier de performance, avant tout réglage du modèle. Tester 100/120 dpi avant d'optimiser quoi que ce soit d'autre.
+1. **L'encodage de l'image domine le coût** (37 s sur 57 s). La résolution d'entrée est donc le principal levier de performance, avant tout réglage du modèle — c'est pourquoi `max_edge_px` vit dans `PreprocessingOptions`.
 2. **Le double passage coûterait ~114 s/page.** L'hypothèse par défaut pour la confiance devient discutable : sur un lot de 200 pages, cela fait 6 h au lieu de 3. Envisager un double passage *sélectif*, déclenché uniquement sur les pages dont le score déclaratif est faible.
 3. **Un lot se compte en heures, pas en minutes.** Le worker doit remonter une progression par page et être reprenable : un traitement de 200 pages qui échoue à la 180ᵉ sans reprise possible est inexploitable.
 
