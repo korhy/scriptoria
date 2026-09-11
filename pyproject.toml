@@ -1,0 +1,95 @@
+[project]
+name = "scriptoria"
+version = "0.1.0"
+description = "Numérisation de documents papier (OCR par LLM vision) et RAG documentaire, 100% local."
+requires-python = ">=3.12"
+
+dependencies = [
+    # API
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.20",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # Persistance — source de vérité
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    # Index de recherche — reconstructible.
+    # L'extra `async` apporte aiohttp : sans lui, AsyncElasticsearch lève au
+    # moment de la construction du client, pas à la première requête.
+    "elasticsearch[async]>=9.0,<10",
+    # Worker
+    "arq>=0.26",
+    "redis>=5.2",
+    # Clients locaux (Ollama via HTTP, aucun SDK propriétaire)
+    "httpx>=0.28",
+    # Prétraitement image
+    "opencv-python-headless>=4.10",
+    "numpy>=2.1",
+    "pillow>=11",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+]
+ui = [
+    "streamlit>=1.40",
+    "httpx>=0.28",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scriptoria"]
+
+# ---------------------------------------------------------------------------
+# Ruff — voir .claude/rules/ecc/python/coding-style.md
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "N",        # pep8-naming
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "S",        # bandit
+    "ASYNC",    # critique ici : détecte les I/O bloquantes dans les routes async
+    "RUF",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "ASYNC"]
+"src/scriptoria/db/migrations/**" = ["E501", "I001"]
+
+# ---------------------------------------------------------------------------
+# Pytest — couverture 80% imposée par .claude/rules/ecc/common/testing.md
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+markers = [
+    "integration: nécessite la stack docker démarrée (make up)",
+    "ollama: nécessite Ollama et ses modèles (make models)",
+    "slow: test long (inférence vision)",
+]
+
+[tool.coverage.run]
+source = ["src/scriptoria"]
+omit = ["*/migrations/*", "*/ui/*"]
+
+[tool.coverage.report]
+show_missing = true

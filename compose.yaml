@@ -1,0 +1,108 @@
+name: scriptoria
+
+# Ollama n'est PAS un service ici : Docker Desktop sur macOS n'expose pas le GPU
+# Metal aux conteneurs. Ollama tourne nativement sur l'hôte et les conteneurs le
+# joignent via host.docker.internal (voir OLLAMA_BASE_URL dans .env).
+
+x-api-common: &api-common
+  build:
+    context: .
+    dockerfile: docker/api.Dockerfile
+  env_file: [.env]
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./data:/data
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    elasticsearch: { condition: service_healthy }
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *api-common
+    ports: ["8000:8000"]
+    command: uvicorn scriptoria.main:app --host 0.0.0.0 --port 8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  worker:
+    <<: *api-common
+    command: arq scriptoria.workers.arq_app.WorkerSettings
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-scriptoria}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scriptoria}
+      POSTGRES_DB: ${POSTGRES_DB:-scriptoria}
+    ports: ["5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scriptoria} -d ${POSTGRES_DB:-scriptoria}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.0
+    environment:
+      - discovery.type=single-node
+      # Sécurité désactivée : instance locale, jamais exposée hors de la machine.
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      # Heap plafonné à 1 Go : la VM Docker ne dispose que de 8 Go.
+      - ES_JAVA_OPTS=${ES_JAVA_OPTS:--Xms1g -Xmx1g}
+    ports: ["9200:9200"]
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+    restart: unless-stopped
+
+  # Non démarré par défaut : docker compose --profile debug up -d kibana
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.1.0
+    profiles: [debug]
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports: ["5601:5601"]
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+
+  ui:
+    build:
+      context: .
+      dockerfile: docker/ui.Dockerfile
+    env_file: [.env]
+    ports: ["8501:8501"]
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  es-data:

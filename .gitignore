@@ -1,0 +1,24 @@
+# Secrets et configuration locale
+.env
+
+# Données : images sources, images prétraitées, markdown produit.
+# Volumineux et reproductibles — ne jamais versionner.
+data/
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Outils
+.DS_Store
+.idea/
+.vscode/
