@@ -116,10 +116,30 @@ Le squelette tourne et les connexions sont vérifiées. **Le pipeline n'est pas 
 - Versioning des corrections : révisions immuables dans `transcriptions`.
 - **Fusion RRF** : vérifié le 2026-09-11 sur ES 9.1.0 licence basic — le `retriever: {rrf: ...}` natif est **refusé** (`current license is non-compliant for [Reciprocal Rank Fusion (RRF)]`). La fusion se fait côté Python via `services/retrieval.py::reciprocal_rank_fusion`, déjà implémentée et testée. `hybrid_search` doit émettre **deux** requêtes (BM25 + kNN) puis fusionner ici — ne pas retenter un retriever RRF.
 
+### Coût OCR mesuré — 2026-09-11, M4 16 Go, `qwen2.5vl:7b`
+
+Mesure sur une page A4 synthétique à 150 dpi (1240×1754), modèle déjà chargé.
+Fixture : `tests/fixtures/page-test.png`.
+
+| Phase | Durée |
+|---|---|
+| Chargement du modèle (à froid uniquement) | 9 s |
+| **Encodage de l'image (`prompt_eval`)** | **37 s** |
+| Génération (214 tokens) | 20 s |
+| **Total par page, modèle chaud** | **~57 s** |
+
+Qualité : accents restitués, structure de tableau Markdown correcte.
+
+**Trois conséquences sur la conception, à ne pas ignorer :**
+
+1. **L'encodage de l'image domine le coût** (37 s sur 57 s). La résolution d'entrée est donc le principal levier de performance, avant tout réglage du modèle. Tester 100/120 dpi avant d'optimiser quoi que ce soit d'autre.
+2. **Le double passage coûterait ~114 s/page.** L'hypothèse par défaut pour la confiance devient discutable : sur un lot de 200 pages, cela fait 6 h au lieu de 3. Envisager un double passage *sélectif*, déclenché uniquement sur les pages dont le score déclaratif est faible.
+3. **Un lot se compte en heures, pas en minutes.** Le worker doit remonter une progression par page et être reprenable : un traitement de 200 pages qui échoue à la 180ᵉ sans reprise possible est inexploitable.
+
 **Non tranché — à décider par l'expérimentation, pas par principe :**
 
-- **Méthode de calcul de la confiance.** Le double passage est l'hypothèse par défaut mais double le coût OCR. La colonne `confidence_blocks.method` existe pour comparer plusieurs méthodes sur les mêmes documents.
-- **Granularité du chunking** (par page ? par section détectée ?). Dépend de la qualité du balisage Markdown produit par l'OCR, qu'on ne peut pas encore évaluer.
+- **Méthode de calcul de la confiance.** Voir le point 2 ci-dessus : le double passage systématique est coûteux au vu de la mesure. La colonne `confidence_blocks.method` existe pour comparer plusieurs méthodes sur les mêmes documents.
+- **Granularité du chunking** (par page ? par section détectée ?). Dépend de la qualité du balisage Markdown produit par l'OCR. Premier signal encourageant sur la fixture, mais un document réel dégradé dira autre chose.
 
 ---
 
