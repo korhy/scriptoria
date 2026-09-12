@@ -18,7 +18,7 @@ from sqlalchemy import select
 from scriptoria.api.deps import AppSettings, DbSession, TaskQueue
 from scriptoria.db.models import Document, Job, Page
 from scriptoria.domain.enums import DocumentStatus, JobStatus
-from scriptoria.schemas.document import DocumentRead
+from scriptoria.schemas.document import DocumentRead, JobAccepted
 from scriptoria.schemas.page import PageRead
 from scriptoria.services.storage import (
     MAX_PAGE_BYTES,
@@ -37,6 +37,7 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 PREPROCESS_TASK = "preprocess_document"
+TRANSCRIBE_TASK = "transcribe_document"
 
 
 @router.get("", response_model=list[DocumentRead], summary="Liste les documents")
@@ -192,3 +193,47 @@ async def create_document(
 
     logger.info("document %s importé (%s pages), prétraitement enfilé", document_id, len(files))
     return document
+
+
+@router.post(
+    "/{document_id}/transcribe",
+    response_model=JobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Enfile la retranscription OCR des pages d'un document",
+)
+async def transcribe_document(
+    document_id: UUID,
+    session: DbSession,
+    queue: TaskQueue,
+) -> JobAccepted:
+    """Met l'OCR en file. Ne transcrit rien : une page coûte de l'ordre de la minute.
+
+    Exige un document `preprocessed`. OCRiser une image non nettoyée dépenserait
+    des heures pour un résultat dégradé, et relancer un document déjà en cours
+    ferait tourner deux modèles vision à la fois sur une machine de 16 Go.
+    """
+    document = await session.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "document introuvable")
+
+    if document.status != DocumentStatus.PREPROCESSED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"document en statut '{document.status.value}' : l'OCR attend un document "
+            f"'{DocumentStatus.PREPROCESSED.value}'.",
+        )
+
+    job = await queue.enqueue_job(TRANSCRIBE_TASK, str(document_id))
+    arq_job_id = getattr(job, "job_id", None)
+    session.add(
+        Job(
+            document_id=document_id,
+            kind="transcribe",
+            status=JobStatus.QUEUED,
+            arq_job_id=arq_job_id,
+        )
+    )
+    await session.flush()
+
+    logger.info("document %s : OCR enfilé (job %s)", document_id, arq_job_id)
+    return JobAccepted(document_id=document_id, kind="transcribe", arq_job_id=arq_job_id)

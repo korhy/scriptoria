@@ -14,12 +14,15 @@ from typing import Any
 from uuid import UUID
 
 import anyio
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import selectinload
 
 from scriptoria.config import Settings
-from scriptoria.db.models import Document, Job, Page
-from scriptoria.domain.enums import DocumentStatus, JobStatus
+from scriptoria.db.models import Document, Job, Page, Transcription
+from scriptoria.domain.enums import DocumentStatus, JobStatus, TranscriptionOrigin
+from scriptoria.services.ocr import transcribe_page
 from scriptoria.services.preprocessing import preprocess_page
 from scriptoria.services.storage import preprocessed_page_relpath
 
@@ -119,13 +122,121 @@ async def preprocess_document(ctx: dict[str, Any], document_id: str) -> None:
         raise
 
 
-async def transcribe_document(ctx: dict[str, Any], document_id: str) -> None:
-    """Retranscrit chaque page en Markdown et calcule la confiance.
+def _already_transcribed(page: Page) -> bool:
+    """Une révision d'origine OCR existe déjà pour cette page.
 
-    Créera une révision 1 d'origine `ocr` par page, puis fera passer le document
-    en `awaiting_validation`.
+    C'est le critère de reprise : il porte sur l'origine, pas sur la simple
+    présence d'une révision — une page saisie à la main n'a jamais été OCRisée.
     """
-    raise NotImplementedError("Tâche OCR — voir services/ocr.py")
+    return any(
+        transcription.origin is TranscriptionOrigin.OCR for transcription in page.transcriptions
+    )
+
+
+async def transcribe_document(ctx: dict[str, Any], document_id: str) -> None:
+    """Retranscrit chaque page en Markdown via le modèle vision.
+
+    Crée une révision d'origine `ocr` par page, puis fait passer le document en
+    `awaiting_validation` : une transcription automatique n'est jamais validée
+    d'office, la validation est un geste humain.
+
+    **Reprenable.** Une page transcrite est validée en base avant de passer à la
+    suivante, et une page portant déjà une révision OCR est ignorée. Sur la
+    machine cible une page coûte ~57 s : un lot de 200 pages tourne trois heures,
+    et un incident à la 180ᵉ page ne doit pas rejouer les 179 premières.
+    """
+    settings: Settings = ctx["settings"]
+    factory: async_sessionmaker[AsyncSession] = ctx["sessionmaker"]
+    client: httpx.AsyncClient = ctx["ollama"]
+    doc_id = UUID(document_id)
+    transcribed = 0
+    skipped = 0
+
+    try:
+        async with factory() as session:
+            document = await session.get(Document, doc_id)
+            if document is None:
+                logger.warning("transcribe_document: document %s introuvable", doc_id)
+                return
+
+            document.status = DocumentStatus.TRANSCRIBING
+            await _update_job(session, doc_id, "transcribe", JobStatus.RUNNING)
+            await session.commit()
+
+            result_pages = await session.execute(
+                select(Page)
+                .where(Page.document_id == doc_id)
+                .order_by(Page.page_number)
+                # Les révisions servent au test de reprise : les charger ici
+                # évite une requête par page dans la boucle.
+                .options(selectinload(Page.transcriptions))
+            )
+            pages = list(result_pages.scalars().all())
+
+            for page in pages:
+                if _already_transcribed(page):
+                    skipped += 1
+                    logger.info(
+                        "document %s page %s déjà transcrite — ignorée", doc_id, page.page_number
+                    )
+                    continue
+
+                # L'image nettoyée si elle existe : c'est elle qui a été
+                # redimensionnée, et la résolution domine le coût de l'OCR.
+                # À défaut, l'originale — mieux vaut transcrire que sauter.
+                relative = page.preprocessed_image_path or page.raw_image_path
+                result = await transcribe_page(
+                    client, settings.data_dir / relative, settings.ollama_vision_model
+                )
+
+                revision = (
+                    max(
+                        (transcription.revision for transcription in page.transcriptions),
+                        default=0,
+                    )
+                    + 1
+                )
+                session.add(
+                    Transcription(
+                        page_id=page.id,
+                        revision=revision,
+                        content_markdown=result.content_markdown,
+                        origin=TranscriptionOrigin.OCR,
+                        model_name=result.model_name,
+                        is_validated=False,
+                    )
+                )
+                # Validation immédiate : c'est ce qui rend la reprise possible.
+                await session.commit()
+                transcribed += 1
+                logger.info(
+                    "document %s page %s transcrite en %.1fs (révision %s)",
+                    doc_id,
+                    page.page_number,
+                    result.duration_seconds,
+                    revision,
+                )
+
+            document.status = DocumentStatus.AWAITING_VALIDATION
+            await _update_job(session, doc_id, "transcribe", JobStatus.DONE)
+            await session.commit()
+
+        logger.info(
+            "document %s transcrit (%s pages, %s déjà faites)", doc_id, transcribed, skipped
+        )
+
+    except Exception as exc:
+        logger.exception("transcription du document %s en échec", doc_id)
+        # Session neuve : celle de la transaction annulée n'est plus utilisable.
+        # Les pages déjà transcrites, elles, sont validées et seront sautées au
+        # prochain passage.
+        async with factory() as session:
+            document = await session.get(Document, doc_id)
+            if document is not None:
+                document.status = DocumentStatus.FAILED
+            await _update_job(session, doc_id, "transcribe", JobStatus.FAILED, error=str(exc))
+            await session.commit()
+        raise
 
 
 async def index_document(ctx: dict[str, Any], document_id: str) -> None:

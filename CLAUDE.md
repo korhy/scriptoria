@@ -111,12 +111,13 @@ MacBook Air M4, **16 Go unifiés**. VM Docker : **8 Go**. Ces chiffres ont des c
 La première moitié du pipeline tourne de bout en bout :
 
 ```
-POST /documents → images écrites → job arq enfilé → worker → prétraitement → PREPROCESSED
+POST /documents → images écrites → job arq → worker → prétraitement → PREPROCESSED
+POST /documents/{id}/transcribe → job arq → worker → OCR page par page → AWAITING_VALIDATION
 ```
 
-**Implémenté** : import multipart (une image par page), stockage, prétraitement OpenCV, worker arq, suivi d'état et de jobs, accès aux images brutes et prétraitées.
+**Implémenté** : import multipart (une image par page), stockage, prétraitement OpenCV, worker arq, suivi d'état et de jobs, accès aux images brutes et prétraitées, **OCR vision** (`services/ocr.py`, tâche `transcribe_document`, route `POST /documents/{id}/transcribe`).
 
-**Pas implémenté** : OCR, confiance, chunking, embeddings, indexation, recherche, UI de validation. Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
+**Pas implémenté** : confiance, validation humaine, chunking, embeddings, indexation, recherche, UI de validation. Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
 
 Deux conventions à respecter en poursuivant :
 
@@ -142,6 +143,17 @@ Fixture : `tests/fixtures/page-test.png`.
 | **Total par page, modèle chaud** | **~57 s** |
 
 Qualité : accents restitués, structure de tableau Markdown correcte.
+
+### Comportements observés de `qwen2.5vl:7b` (2026-09-12)
+
+- **Il emballe la page entière dans un bloc ```markdown**, comme s'il répondait en
+  conversation. C'est un artefact de dialogue, pas du contenu : `services/ocr.py`
+  le retire (`_unwrap_fenced_block`), sauf si la page contient elle-même du code.
+- **Une transcription vide est traitée comme une panne**, jamais comme une page
+  blanche. Accepter silencieusement une réponse vide archiverait une page perdue
+  sous les apparences d'un succès.
+- L'OCR **ne valide jamais** sa propre sortie : la révision 1 d'origine `ocr` naît
+  avec `is_validated = false`. La validation reste un geste humain.
 
 ### Résolution : le levier de coût est réel, et il a un prix
 
