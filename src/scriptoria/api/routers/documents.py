@@ -29,15 +29,13 @@ from scriptoria.services.storage import (
     validate_image_suffix,
     write_page_bytes,
 )
+from scriptoria.workers import PREPROCESS_TASK, TRANSCRIBE_TASK
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
-
-PREPROCESS_TASK = "preprocess_document"
-TRANSCRIBE_TASK = "transcribe_document"
 
 
 @router.get("", response_model=list[DocumentRead], summary="Liste les documents")

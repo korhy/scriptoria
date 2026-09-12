@@ -16,8 +16,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from scriptoria.api.deps import get_db
-from scriptoria.db.models import ConfidenceBlock, Document, Page, Transcription
+from scriptoria.api.deps import get_db, get_queue
+from scriptoria.db.models import ConfidenceBlock, Document, Job, Page, Transcription
 from scriptoria.domain.enums import DocumentStatus, TranscriptionOrigin
 
 
@@ -33,6 +33,21 @@ class FakeResult:
 
     def scalar_one_or_none(self) -> Any:
         return self._rows[0] if self._rows else None
+
+
+class FakeJob:
+    job_id = "job-de-test"
+
+
+class FakeQueue:
+    """File arq simulée : enregistre ce qui a été enfilé, n'exécute rien."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def enqueue_job(self, name: str, *args: Any, **kwargs: Any) -> FakeJob:
+        self.enqueued.append((name, args))
+        return FakeJob()
 
 
 class FakeSession:
@@ -90,6 +105,17 @@ def page_avec(transcriptions: list[Transcription], document_id: UUID) -> Page:
     return page
 
 
+def build_client(app: FastAPI, session: FakeSession, queue: FakeQueue) -> TestClient:
+    """Client dont la base et la file sont simulées."""
+
+    async def _db() -> AsyncIterator[FakeSession]:
+        yield session
+
+    app.dependency_overrides[get_db] = _db
+    app.dependency_overrides[get_queue] = lambda: queue
+    return TestClient(app, raise_server_exceptions=False)
+
+
 @pytest.fixture
 def document() -> Document:
     return Document(
@@ -101,15 +127,17 @@ def document() -> Document:
 
 
 @pytest.fixture
-def contexte(app: FastAPI, document: Document) -> Iterator[tuple[TestClient, FakeSession, Page]]:
+def queue() -> FakeQueue:
+    return FakeQueue()
+
+
+@pytest.fixture
+def contexte(
+    app: FastAPI, document: Document, queue: FakeQueue
+) -> Iterator[tuple[TestClient, FakeSession, Page]]:
     page = page_avec([revision_ocr(uuid4())], document.id)
     session = FakeSession(document, [page])
-
-    async def _db() -> AsyncIterator[FakeSession]:
-        yield session
-
-    app.dependency_overrides[get_db] = _db
-    yield TestClient(app, raise_server_exceptions=False), session, page
+    yield build_client(app, session, queue), session, page
 
 
 # --- Lecture ----------------------------------------------------------------
@@ -142,13 +170,7 @@ def test_le_score_de_confiance_de_la_page_est_expose(
 
 
 def test_une_page_inconnue_donne_404(app: FastAPI) -> None:
-    session = FakeSession(None, [])
-
-    async def _db() -> AsyncIterator[FakeSession]:
-        yield session
-
-    app.dependency_overrides[get_db] = _db
-    client = TestClient(app, raise_server_exceptions=False)
+    client = build_client(app, FakeSession(None, []), FakeQueue())
 
     assert client.get(f"/pages/{uuid4()}").status_code == 404
 
@@ -222,13 +244,7 @@ def test_une_page_jamais_transcrite_accepte_une_saisie_manuelle(
 ) -> None:
     """Une page que l'OCR a échoué à lire doit pouvoir être saisie à la main."""
     page = page_avec([], document.id)
-    session = FakeSession(document, [page])
-
-    async def _db() -> AsyncIterator[FakeSession]:
-        yield session
-
-    app.dependency_overrides[get_db] = _db
-    client = TestClient(app, raise_server_exceptions=False)
+    client = build_client(app, FakeSession(document, [page]), FakeQueue())
 
     corps = client.post(
         f"/pages/{page.id}/corrections",
@@ -274,13 +290,7 @@ def test_une_page_non_validee_retient_le_document(app: FastAPI, document: Docume
     premiere = page_avec([revision_ocr(uuid4())], document.id)
     seconde = page_avec([revision_ocr(uuid4())], document.id)
     document.page_count = 2
-    session = FakeSession(document, [premiere, seconde])
-
-    async def _db() -> AsyncIterator[FakeSession]:
-        yield session
-
-    app.dependency_overrides[get_db] = _db
-    client = TestClient(app, raise_server_exceptions=False)
+    client = build_client(app, FakeSession(document, [premiere, seconde]), FakeQueue())
 
     client.post(
         f"/pages/{premiere.id}/corrections",
@@ -307,13 +317,7 @@ def test_une_correction_sans_validation_ne_fait_pas_avancer_le_document(
 def test_une_page_sans_transcription_n_a_pas_de_score(app: FastAPI, document: Document) -> None:
     """Pas de transcription, pas de score — surtout pas un 1,00 rassurant."""
     page = page_avec([], document.id)
-    session = FakeSession(document, [page])
-
-    async def _db() -> AsyncIterator[FakeSession]:
-        yield session
-
-    app.dependency_overrides[get_db] = _db
-    client = TestClient(app, raise_server_exceptions=False)
+    client = build_client(app, FakeSession(document, [page]), FakeQueue())
 
     corps = client.get(f"/pages/{page.id}").json()
 
@@ -324,13 +328,7 @@ def test_une_page_sans_transcription_n_a_pas_de_score(app: FastAPI, document: Do
 def test_une_correction_sur_une_page_orpheline_donne_404(app: FastAPI) -> None:
     """Une page sans document n'existe pas ; le dire plutôt que de lever un 500."""
     page = page_avec([revision_ocr(uuid4())], uuid4())
-    session = FakeSession(None, [page])
-
-    async def _db() -> AsyncIterator[FakeSession]:
-        yield session
-
-    app.dependency_overrides[get_db] = _db
-    client = TestClient(app, raise_server_exceptions=False)
+    client = build_client(app, FakeSession(None, [page]), FakeQueue())
 
     response = client.post(
         f"/pages/{page.id}/corrections",
@@ -343,12 +341,7 @@ def test_une_correction_sur_une_page_orpheline_donne_404(app: FastAPI) -> None:
 
 def test_une_correction_sur_une_page_inconnue_donne_404(app: FastAPI, document: Document) -> None:
     session = FakeSession(document, [])
-
-    async def _db() -> AsyncIterator[FakeSession]:
-        yield session
-
-    app.dependency_overrides[get_db] = _db
-    client = TestClient(app, raise_server_exceptions=False)
+    client = build_client(app, session, FakeQueue())
 
     response = client.post(
         f"/pages/{uuid4()}/corrections",
@@ -357,3 +350,66 @@ def test_une_correction_sur_une_page_inconnue_donne_404(app: FastAPI, document: 
 
     assert response.status_code == 404
     assert session.added == [], "rien ne doit être écrit pour une page inexistante"
+
+
+# --- Enchaînement vers l'indexation -----------------------------------------
+
+
+def test_l_indexation_est_enfilee_quand_le_document_devient_valide(
+    contexte: tuple[TestClient, FakeSession, Page],
+    queue: FakeQueue,
+    document: Document,
+) -> None:
+    """Vectoriser 200 pages prend des minutes : la requête HTTP enfile, elle n'exécute pas."""
+    client, _, page = contexte
+
+    client.post(
+        f"/pages/{page.id}/corrections",
+        json={"content_markdown": "page relue", "validate_now": True},
+    )
+
+    assert queue.enqueued == [("index_document", (str(document.id),))]
+
+
+def test_le_job_d_indexation_est_trace_en_base(
+    contexte: tuple[TestClient, FakeSession, Page],
+) -> None:
+    client, session, page = contexte
+
+    client.post(
+        f"/pages/{page.id}/corrections",
+        json={"content_markdown": "page relue", "validate_now": True},
+    )
+
+    jobs = [obj for obj in session.added if isinstance(obj, Job)]
+    assert [job.kind for job in jobs] == ["index"]
+
+
+def test_rien_n_est_enfile_tant_qu_une_page_reste_a_valider(
+    app: FastAPI, document: Document
+) -> None:
+    premiere = page_avec([revision_ocr(uuid4())], document.id)
+    seconde = page_avec([revision_ocr(uuid4())], document.id)
+    document.page_count = 2
+    queue = FakeQueue()
+    client = build_client(app, FakeSession(document, [premiere, seconde]), queue)
+
+    client.post(
+        f"/pages/{premiere.id}/corrections",
+        json={"content_markdown": "première page relue", "validate_now": True},
+    )
+
+    assert queue.enqueued == []
+
+
+def test_une_correction_sans_validation_n_enfile_rien(
+    contexte: tuple[TestClient, FakeSession, Page], queue: FakeQueue
+) -> None:
+    client, _, page = contexte
+
+    client.post(
+        f"/pages/{page.id}/corrections",
+        json={"content_markdown": "brouillon", "validate_now": False},
+    )
+
+    assert queue.enqueued == []

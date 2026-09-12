@@ -17,11 +17,12 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from scriptoria.api.deps import DbSession
-from scriptoria.db.models import Document, Page, Transcription
-from scriptoria.domain.enums import DocumentStatus, TranscriptionOrigin
+from scriptoria.api.deps import DbSession, TaskQueue
+from scriptoria.db.models import Document, Job, Page, Transcription
+from scriptoria.domain.enums import DocumentStatus, JobStatus, TranscriptionOrigin
 from scriptoria.schemas.page import PageDetail, RevisionCreated, TranscriptionCorrection
 from scriptoria.services.confidence import ConfidenceBlock, aggregate_page_score
+from scriptoria.workers import INDEX_TASK
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +63,16 @@ def _page_score(page: Page) -> float | None:
     )
 
 
-async def _validate_document_if_complete(session: DbSession, document: Document) -> None:
-    """Fait passer le document en `validated` si chacune de ses pages l'est.
+async def _validate_document_if_complete(
+    session: DbSession, document: Document, queue: TaskQueue
+) -> None:
+    """Valide le document si chacune de ses pages l'est, puis enfile l'indexation.
 
     Il n'existe pas de validation globale : un document devient valide parce que
     toutes ses pages l'ont été, une par une.
+
+    L'indexation est **enfilée**, pas exécutée : vectoriser 200 pages prend des
+    minutes, ce n'est pas le travail d'une requête HTTP.
     """
     result = await session.execute(
         select(Page)
@@ -81,10 +87,18 @@ async def _validate_document_if_complete(session: DbSession, document: Document)
         return
 
     document.status = DocumentStatus.VALIDATED
-    # L'indexation sera enfilée ici quand `index_document` existera (phase 4).
-    # Ne pas l'enfiler d'ici là : la tâche lève `NotImplementedError`, et un job
-    # en échec laisserait croire que la validation a mal tourné.
-    logger.info("document %s validé — indexation pas encore branchée", document.id)
+
+    job = await queue.enqueue_job(INDEX_TASK, str(document.id))
+    arq_job_id = getattr(job, "job_id", None)
+    session.add(
+        Job(
+            document_id=document.id,
+            kind="index",
+            status=JobStatus.QUEUED,
+            arq_job_id=arq_job_id,
+        )
+    )
+    logger.info("document %s validé — indexation enfilée (job %s)", document.id, arq_job_id)
 
 
 @router.get("/{page_id}", response_model=PageDetail, summary="Détail d'une page")
@@ -107,6 +121,7 @@ async def correct_page(
     page_id: UUID,
     payload: TranscriptionCorrection,
     session: DbSession,
+    queue: TaskQueue,
 ) -> RevisionCreated:
     """Insère une révision `n+1` d'origine `human`. Ne modifie jamais la précédente.
 
@@ -138,7 +153,7 @@ async def correct_page(
     await session.flush()
 
     if payload.validate_now:
-        await _validate_document_if_complete(session, document)
+        await _validate_document_if_complete(session, document, queue)
 
     logger.info(
         "page %s : révision %s enregistrée (validée=%s)", page.id, revision, payload.validate_now

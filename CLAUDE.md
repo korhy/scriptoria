@@ -114,11 +114,12 @@ La première moitié du pipeline tourne de bout en bout :
 POST /documents → images écrites → job arq → worker → prétraitement → PREPROCESSED
 POST /documents/{id}/transcribe → job arq → worker → OCR page par page → AWAITING_VALIDATION
 POST /pages/{id}/corrections → révision n+1 `human` → toutes les pages validées → VALIDATED
+                            → job arq → worker → chunking + embeddings → INDEXED
 ```
 
-**Implémenté** : import multipart (une image par page), stockage, prétraitement OpenCV, worker arq, suivi d'état et de jobs, accès aux images brutes et prétraitées, **OCR vision** (`services/ocr.py`, tâche `transcribe_document`, route `POST /documents/{id}/transcribe`), **confiance** (`services/confidence.py`, `services/markdown_tables.py`, blocs persistés par révision), **validation humaine** (`GET /pages/{id}`, `POST /pages/{id}/corrections`, UI Streamlit côte à côte).
+**Implémenté** : import multipart (une image par page), stockage, prétraitement OpenCV, worker arq, suivi d'état et de jobs, accès aux images brutes et prétraitées, **OCR vision** (`services/ocr.py`, tâche `transcribe_document`, route `POST /documents/{id}/transcribe`), **confiance** (`services/confidence.py`, `services/markdown_tables.py`, blocs persistés par révision), **validation humaine** (`GET /pages/{id}`, `POST /pages/{id}/corrections`, UI Streamlit côte à côte), **indexation** (`services/chunking.py`, `embeddings.py`, `indexing.py`, tâche `index_document`, `make reindex`).
 
-**Pas implémenté** : chunking, embeddings, indexation, recherche, UI de validation. Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
+**Pas implémenté** : recherche hybride et génération (`services/retrieval.py::hybrid_search`, `build_answer_context`, routes `/search` et `/search/answer` en 501). Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
 
 Deux conventions à respecter en poursuivant :
 
@@ -215,19 +216,40 @@ texte libre n'offre aucune prise à ces contrôles.
 ### Validation : ce qui reste à brancher (2026-09-12)
 
 Un document passe en `VALIDATED` dès que **chacune** de ses pages porte une
-révision validée — il n'existe pas d'approbation globale. L'enfilage de
-`index_document` à ce moment-là est **volontairement absent** : la tâche lève
-encore `NotImplementedError`, et un job en échec laisserait croire que la
-validation a mal tourné. L'emplacement exact est marqué en commentaire dans
-`api/routers/pages.py::_validate_document_if_complete`.
+révision validée — il n'existe pas d'approbation globale. L'indexation est alors
+**enfilée** (job `index`), jamais exécutée dans la requête : vectoriser 200 pages
+prend des minutes.
 
 Valider sans rien changer crée quand même une révision `human` : c'est ce qui
 date l'accord du relecteur, et l'historique reste lisible de bout en bout.
 
+### Indexation : tranché le 2026-09-12
+
+- **Un fragment par page.** C'est l'unité de validation humaine, et l'identifiant
+  qui en découle (`<document_id>:<page>`) est lisible et stable.
+- **`chunk_id` ne dérive jamais du contenu.** Une correction humaine doit
+  *remplacer* le fragment ; un identifiant dérivé du texte laisserait l'ancienne
+  version indexée à côté de la nouvelle, soit deux réponses contradictoires pour
+  la même page. C'est aussi ce qui rend `make reindex` rejouable à volonté.
+- **Seule la dernière révision validée est indexée.** Un document dont une page
+  n'a pas été relue **n'est pas indexé à moitié** : la tâche échoue en nommant la
+  page. Un index partiel qui se présente comme complet est pire qu'une absence
+  d'index.
+- **`make reindex` supprime l'index avant de le reconstruire.** Reconstruire
+  par-dessus laisserait survivre des fragments de pages supprimées depuis ;
+  l'index doit être le reflet de la base, pas son cumul historique.
+- **Vectorisation par lots de 16.** 200 pages en un seul appel feraient déborder
+  les 16 Go de la machine.
+
+Vérifié sur la stack : import → prétraitement → OCR → validation → indexation
+(1024 dimensions, `bge-m3`), puis `make reindex` deux fois de suite — 4 fragments,
+l'index reste à 4. Une recherche BM25 sur « cartouches encre » remonte bien les
+pages concernées, racines françaises comprises.
+
 **Non tranché — à décider par l'expérimentation, pas par principe :**
 
 - **Méthode de calcul de la confiance : tranchée le 2026-09-12**, voir ci-dessous. La colonne `confidence_blocks.method` reste là pour comparer les trois méthodes sur les mêmes documents — l'affaire n'est pas close, seulement instruite.
-- **Granularité du chunking** (par page ? par section détectée ?). Dépend de la qualité du balisage Markdown produit par l'OCR. Premier signal encourageant sur la fixture, mais un document réel dégradé dira autre chose.
+- **Granularité du chunking : par page pour l'instant** (2026-09-12), faute de mesure. Le découpage par section reste à évaluer sur des documents réels dégradés — en changer n'impose de toucher qu'à `chunk_markdown`, puis de réindexer.
 
 ---
 

@@ -1,15 +1,14 @@
 """Découpage du Markdown validé en fragments indexables.
 
-**Point ouvert — non tranché.** Deux granularités s'opposent :
+**Granularité retenue le 2026-09-12 : une page, un fragment.** C'est l'unité de
+validation humaine, et un identifiant lisible en découle (`<document>:<page>`).
 
-- *Par page* : simple, aligné sur l'unité de validation, mais un fragment d'une
-  page entière dilue le signal sémantique à la recherche.
-- *Par section détectée dans le Markdown* (titres, paragraphes) : fragments plus
-  cohérents, mais dépend de la qualité du balisage produit par l'OCR — qui est
-  précisément ce dont on ne peut pas encore juger.
-
-Trancher demande de mesurer la qualité de recherche sur des documents réels.
-En attendant, le découpage reste isolé derrière cette fonction.
+Le découpage par section reste ouvert : il dépend de la qualité du balisage
+produit par l'OCR, qu'on ne saura juger que sur des documents réels dégradés.
+Le premier signal est encourageant (titres et tableaux correctement rendus sur la
+fixture), mais il ne vaut pas mesure. Tant que le découpage tient dans cette
+fonction, en changer n'imposera pas de toucher au reste du pipeline — seulement
+de réindexer, ce que `make reindex` sait faire.
 """
 
 from dataclasses import dataclass
@@ -30,6 +29,32 @@ class Chunk:
     content: str
 
 
+def make_chunk_id(document_id: UUID, page_number: int) -> str:
+    """Identifiant stable d'un fragment.
+
+    Dérivé de la position (document, page) et **jamais du contenu** : une
+    correction humaine doit remplacer le fragment existant. Un identifiant
+    dérivé du texte laisserait l'ancienne version indexée à côté de la nouvelle,
+    soit deux réponses contradictoires pour la même page.
+    """
+    return f"{document_id}:{page_number}"
+
+
 def chunk_markdown(markdown: str, document_id: UUID, page_number: int) -> list[Chunk]:
-    """Découpe le Markdown validé d'une page en fragments."""
-    raise NotImplementedError("Chunking — granularité à trancher puis implémenter")
+    """Découpe le Markdown validé d'une page en fragments.
+
+    Une page sans texte ne produit rien : indexer une chaîne vide polluerait la
+    recherche d'un résultat creux.
+    """
+    content = markdown.strip()
+    if not content:
+        return []
+
+    return [
+        Chunk(
+            chunk_id=make_chunk_id(document_id, page_number),
+            document_id=document_id,
+            page_number=page_number,
+            content=content,
+        )
+    ]

@@ -10,12 +10,14 @@ reprise après incident possible sans nettoyage préalable.
 """
 
 import logging
+from itertools import batched
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import anyio
 import httpx
+from elasticsearch import AsyncElasticsearch
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
@@ -24,17 +26,29 @@ from scriptoria.config import Settings
 from scriptoria.db.models import ConfidenceBlock as ConfidenceBlockRow
 from scriptoria.db.models import Document, Job, Page, Transcription
 from scriptoria.domain.enums import DocumentStatus, JobStatus, TranscriptionOrigin
+from scriptoria.services.chunking import Chunk, chunk_markdown
 from scriptoria.services.confidence import (
     ConfidenceBlock,
     aggregate_page_score,
     analyse_markdown,
     compare_passes,
 )
+from scriptoria.services.embeddings import embed_texts
+from scriptoria.services.indexing import (
+    IndexingError,
+    ensure_index,
+    index_chunks,
+    validate_embedding_dim,
+)
 from scriptoria.services.ocr import OcrResult, transcribe_page
 from scriptoria.services.preprocessing import preprocess_page
 from scriptoria.services.storage import preprocessed_page_relpath
 
 logger = logging.getLogger(__name__)
+
+# Vectoriser 200 pages en un seul appel ferait déborder les 16 Go de la machine.
+# Un lot de 16 fragments reste confortable et amortit les allers-retours HTTP.
+EMBEDDING_BATCH_SIZE = 16
 
 
 async def _update_job(
@@ -293,6 +307,106 @@ async def transcribe_document(ctx: dict[str, Any], document_id: str) -> None:
         raise
 
 
-async def index_document(ctx: dict[str, Any], document_id: str) -> None:
-    """Découpe, vectorise et indexe les transcriptions validées d'un document."""
-    raise NotImplementedError("Tâche d'indexation — voir services/indexing.py")
+def _latest_validated(page: Page) -> Transcription | None:
+    """Dernière révision validée d'une page, s'il y en a une.
+
+    « Validée », pas « la plus récente » : une correction en cours d'écriture ne
+    doit pas se retrouver dans l'index.
+    """
+    validees = [
+        transcription for transcription in page.transcriptions if transcription.is_validated
+    ]
+    if not validees:
+        return None
+    return max(validees, key=lambda transcription: transcription.revision)
+
+
+def _collect_chunks(pages: list[Page], doc_id: UUID) -> tuple[list[Chunk], list[int]]:
+    """Fragments issus des révisions validées, et numéros des pages qui n'en ont pas."""
+    chunks: list[Chunk] = []
+    unvalidated: list[int] = []
+
+    for page in pages:
+        validated = _latest_validated(page)
+        if validated is None:
+            unvalidated.append(page.page_number)
+            continue
+        chunks.extend(chunk_markdown(validated.content_markdown, doc_id, page.page_number))
+
+    return chunks, unvalidated
+
+
+async def index_document(ctx: dict[str, Any], document_id: str) -> int:
+    """Découpe, vectorise et indexe les transcriptions validées d'un document.
+
+    Retourne le nombre de fragments écrits — `make reindex` s'en sert pour dire
+    ce qu'il a reconstruit.
+
+    Idempotent : l'identifiant ES d'un fragment dérive de sa position (document,
+    page), si bien qu'un second passage écrase au lieu de dupliquer. C'est ce qui
+    permet de réindexer un document corrigé, et de rejouer `make reindex` sans
+    vider l'index au préalable.
+
+    N'indexe **que** les révisions validées. Un document dont une page n'a pas
+    été relue n'est pas indexé à moitié : la tâche échoue en nommant la page.
+    Un index à moitié rempli qui se présente comme complet est pire qu'une
+    absence d'index.
+    """
+    settings: Settings = ctx["settings"]
+    factory: async_sessionmaker[AsyncSession] = ctx["sessionmaker"]
+    es: AsyncElasticsearch = ctx["es"]
+    client: httpx.AsyncClient = ctx["ollama"]
+    doc_id = UUID(document_id)
+    written = 0
+
+    try:
+        async with factory() as session:
+            document = await session.get(Document, doc_id)
+            if document is None:
+                logger.warning("index_document: document %s introuvable", doc_id)
+                return 0
+
+            await _update_job(session, doc_id, "index", JobStatus.RUNNING)
+            await session.commit()
+
+            result_pages = await session.execute(
+                select(Page)
+                .where(Page.document_id == doc_id)
+                .order_by(Page.page_number)
+                .options(selectinload(Page.transcriptions))
+            )
+            chunks, unvalidated = _collect_chunks(list(result_pages.scalars().all()), doc_id)
+            if unvalidated:
+                raise IndexingError(
+                    f"document {doc_id} : page(s) {unvalidated} sans révision validée. "
+                    "Indexer un document à moitié relu le ferait passer pour complet."
+                )
+
+            # Avant toute vectorisation : inutile de payer des embeddings si
+            # l'index ne peut pas être créé.
+            await ensure_index(es, settings.elasticsearch_index, settings.embedding_dim)
+
+            for batch in batched(chunks, EMBEDDING_BATCH_SIZE):
+                lot = list(batch)
+                vectors = await embed_texts(
+                    client, [chunk.content for chunk in lot], settings.ollama_embedding_model
+                )
+                validate_embedding_dim(vectors, settings.embedding_dim)
+                written += await index_chunks(es, settings.elasticsearch_index, lot, vectors)
+
+            document.status = DocumentStatus.INDEXED
+            await _update_job(session, doc_id, "index", JobStatus.DONE)
+            await session.commit()
+
+        logger.info("document %s indexé (%s fragment(s))", doc_id, written)
+        return written
+
+    except Exception as exc:
+        logger.exception("indexation du document %s en échec", doc_id)
+        async with factory() as session:
+            document = await session.get(Document, doc_id)
+            if document is not None:
+                document.status = DocumentStatus.FAILED
+            await _update_job(session, doc_id, "index", JobStatus.FAILED, error=str(exc))
+            await session.commit()
+        raise
