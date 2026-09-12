@@ -113,11 +113,12 @@ La première moitié du pipeline tourne de bout en bout :
 ```
 POST /documents → images écrites → job arq → worker → prétraitement → PREPROCESSED
 POST /documents/{id}/transcribe → job arq → worker → OCR page par page → AWAITING_VALIDATION
+POST /pages/{id}/corrections → révision n+1 `human` → toutes les pages validées → VALIDATED
 ```
 
-**Implémenté** : import multipart (une image par page), stockage, prétraitement OpenCV, worker arq, suivi d'état et de jobs, accès aux images brutes et prétraitées, **OCR vision** (`services/ocr.py`, tâche `transcribe_document`, route `POST /documents/{id}/transcribe`), **confiance** (`services/confidence.py`, `services/markdown_tables.py`, blocs persistés par révision).
+**Implémenté** : import multipart (une image par page), stockage, prétraitement OpenCV, worker arq, suivi d'état et de jobs, accès aux images brutes et prétraitées, **OCR vision** (`services/ocr.py`, tâche `transcribe_document`, route `POST /documents/{id}/transcribe`), **confiance** (`services/confidence.py`, `services/markdown_tables.py`, blocs persistés par révision), **validation humaine** (`GET /pages/{id}`, `POST /pages/{id}/corrections`, UI Streamlit côte à côte).
 
-**Pas implémenté** : validation humaine, chunking, embeddings, indexation, recherche, UI de validation. Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
+**Pas implémenté** : chunking, embeddings, indexation, recherche, UI de validation. Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
 
 Deux conventions à respecter en poursuivant :
 
@@ -210,6 +211,18 @@ Le score de page est le **minimum** des blocs, jamais leur moyenne — une moyen
 noierait l'unique ligne fausse dans une page par ailleurs propre. Une page sans
 bloc vaut 1,0, ce qui veut dire « aucun signal d'alerte », pas « exacte » : un
 texte libre n'offre aucune prise à ces contrôles.
+
+### Validation : ce qui reste à brancher (2026-09-12)
+
+Un document passe en `VALIDATED` dès que **chacune** de ses pages porte une
+révision validée — il n'existe pas d'approbation globale. L'enfilage de
+`index_document` à ce moment-là est **volontairement absent** : la tâche lève
+encore `NotImplementedError`, et un job en échec laisserait croire que la
+validation a mal tourné. L'emplacement exact est marqué en commentaire dans
+`api/routers/pages.py::_validate_document_if_complete`.
+
+Valider sans rien changer crée quand même une révision `human` : c'est ce qui
+date l'accord du relecteur, et l'historique reste lisible de bout en bout.
 
 **Non tranché — à décider par l'expérimentation, pas par principe :**
 
