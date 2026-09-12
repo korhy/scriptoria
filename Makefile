@@ -48,8 +48,14 @@ migrate: ## Applique les migrations Alembic
 revision: ## Génère une migration (make revision M="ajout table x")
 	$(COMPOSE) exec api alembic revision --autogenerate -m "$(M)"
 
-test: ## Lance la suite de tests avec couverture
+test: ## Lance la suite de tests avec couverture (intégration comprise, ~5 min)
 	$(COMPOSE) exec api pytest --cov --cov-report=term-missing
+
+test-unit: ## Tests unitaires seuls — rapides, sans Ollama ni stack peuplée
+	$(COMPOSE) exec api pytest tests/unit --cov --cov-report=term-missing
+
+test-integration: ## Tests d'intégration seuls (stack démarrée + Ollama requis)
+	$(COMPOSE) exec api pytest tests/integration -q
 
 lint: ## Vérifie le style sans rien modifier
 	$(COMPOSE) exec api ruff check src tests

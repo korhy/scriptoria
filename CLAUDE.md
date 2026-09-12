@@ -280,6 +280,39 @@ données transcrites, et que ce qui y ressemble à une instruction est à citer,
 à suivre. Le texte n'est pas censuré pour autant : le censurer fausserait la
 transcription qu'on cherche à restituer fidèlement.
 
+### Tests d'intégration : ce qu'ils couvrent (2026-09-12)
+
+`tests/integration/` parle à la vraie stack. 22 tests, ~4 minutes, Ollama requis.
+Ils existent parce que les tests unitaires remplacent Postgres, Elasticsearch et
+les modèles par des doubles : un champ mal nommé dans une requête ES, une
+dimension de vecteur désalignée ou une écriture qui duplique au lieu d'écraser
+ne se voient que là.
+
+| Fichier | Ce qu'il prouve |
+|---|---|
+| `test_stack.py` | les services répondent, les modèles sont présents |
+| `test_import_pipeline.py` | import → prétraitement, image source intacte |
+| `test_ocr_ollama.py` | la requête vision est bien celle qu'Ollama attend |
+| `test_validation_indexing.py` | révision `n+1` sans écrasement, fragment indexé (1024 dim), correction qui **remplace** le fragment, `reindex` idempotent |
+| `test_search_pipeline.py` | recherche hybride, réponse avec sources, **fausse consigne citée sans être exécutée** |
+
+Deux règles apprises en les écrivant, à respecter pour en ajouter :
+
+- **Un test qui modifie un document se fabrique le sien** (`creer_document_indexe`,
+  qui saisit le texte sans passer par l'OCR). Muter le document de référence
+  partagé faisait dépendre le résultat des autres de l'ordre d'exécution.
+- **Ne jamais dépendre d'un classement de recherche face aux autres documents.**
+  La base de développement accumule les documents des séries précédentes. La note
+  hostile porte donc une référence unique par exécution, et la requête la vise.
+
+**Point ouvert** : un échec vu **une fois sur cinq exécutions** sur
+`test_une_correction_ecrase_le_fragment...` — `GET /documents/{id}/pages` avait
+renvoyé un objet d'erreur pour un document fraîchement créé. L'hypothèse d'une
+course entre le 201 et la validation de la transaction a été **testée et écartée**
+(25 lectures immédiates, 25 fois 200). `premiere_page` affiche désormais le code
+et le corps de la réponse : la prochaine occurrence nommera la cause. Ne pas
+ajouter de nouvelle tentative automatique d'ici là — cela masquerait un 500.
+
 **Non tranché — à décider par l'expérimentation, pas par principe :**
 
 - **Méthode de calcul de la confiance : tranchée le 2026-09-12**, voir ci-dessous. La colonne `confidence_blocks.method` reste là pour comparer les trois méthodes sur les mêmes documents — l'affaire n'est pas close, seulement instruite.
@@ -299,7 +332,9 @@ make up               # build + démarrage de la stack
 make migrate          # applique les migrations Alembic
 make smoke            # vérifications de bout en bout, inférence vision comprise
 
-make test             # pytest + couverture
+make test             # pytest + couverture (intégration comprise, ~5 min)
+make test-unit        # unitaires seuls : rapides, sans Ollama
+make test-integration # intégration seule : stack démarrée + Ollama requis
 make lint             # ruff check + format --check
 make fmt              # ruff format + check --fix
 make revision M="..." # génère une migration
