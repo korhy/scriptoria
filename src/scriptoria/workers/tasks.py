@@ -10,6 +10,7 @@ reprise après incident possible sans nettoyage préalable.
 """
 
 import logging
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -20,9 +21,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from scriptoria.config import Settings
+from scriptoria.db.models import ConfidenceBlock as ConfidenceBlockRow
 from scriptoria.db.models import Document, Job, Page, Transcription
 from scriptoria.domain.enums import DocumentStatus, JobStatus, TranscriptionOrigin
-from scriptoria.services.ocr import transcribe_page
+from scriptoria.services.confidence import (
+    ConfidenceBlock,
+    aggregate_page_score,
+    analyse_markdown,
+    compare_passes,
+)
+from scriptoria.services.ocr import OcrResult, transcribe_page
 from scriptoria.services.preprocessing import preprocess_page
 from scriptoria.services.storage import preprocessed_page_relpath
 
@@ -122,6 +130,38 @@ async def preprocess_document(ctx: dict[str, Any], document_id: str) -> None:
         raise
 
 
+async def _transcribe_with_confidence(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    image: Path,
+) -> tuple[OcrResult, list[ConfidenceBlock]]:
+    """Transcrit une page et en dérive ses blocs de confiance.
+
+    Les contrôles gratuits (cohérence arithmétique, structure) s'appliquent à
+    toutes les pages. Le second passage, lui, ne se déclenche que si ces
+    contrôles ont déjà fait tomber le score : il coûte ~57 s de plus, soit trois
+    heures supplémentaires sur un lot de 200 pages s'il était systématique.
+
+    Le passage conservé est toujours le premier — température nulle, donc le plus
+    fidèle ; le second ne sert qu'à mesurer la stabilité de la lecture.
+    """
+    result = await transcribe_page(client, image, settings.ollama_vision_model)
+    blocks = analyse_markdown(result.content_markdown)
+
+    score = aggregate_page_score(blocks)
+    if score >= settings.confidence_second_pass_threshold:
+        return result, blocks
+
+    logger.info("page %s : score %.2f — second passage de vérification", image.name, score)
+    second = await transcribe_page(
+        client,
+        image,
+        settings.ollama_vision_model,
+        temperature=settings.confidence_second_pass_temperature,
+    )
+    return result, blocks + compare_passes(result.content_markdown, second.content_markdown)
+
+
 def _already_transcribed(page: Page) -> bool:
     """Une révision d'origine OCR existe déjà pour cette page.
 
@@ -185,8 +225,8 @@ async def transcribe_document(ctx: dict[str, Any], document_id: str) -> None:
                 # redimensionnée, et la résolution domine le coût de l'OCR.
                 # À défaut, l'originale — mieux vaut transcrire que sauter.
                 relative = page.preprocessed_image_path or page.raw_image_path
-                result = await transcribe_page(
-                    client, settings.data_dir / relative, settings.ollama_vision_model
+                result, blocks = await _transcribe_with_confidence(
+                    client, settings, settings.data_dir / relative
                 )
 
                 revision = (
@@ -204,17 +244,31 @@ async def transcribe_document(ctx: dict[str, Any], document_id: str) -> None:
                         origin=TranscriptionOrigin.OCR,
                         model_name=result.model_name,
                         is_validated=False,
+                        # Rattachés à la révision : un bloc n'a de sens que
+                        # relativement au texte dont il donne les offsets.
+                        confidence_blocks=[
+                            ConfidenceBlockRow(
+                                start_offset=block.start_offset,
+                                end_offset=block.end_offset,
+                                score=block.score,
+                                method=block.method,
+                            )
+                            for block in blocks
+                        ],
                     )
                 )
                 # Validation immédiate : c'est ce qui rend la reprise possible.
                 await session.commit()
                 transcribed += 1
                 logger.info(
-                    "document %s page %s transcrite en %.1fs (révision %s)",
+                    "document %s page %s transcrite en %.1fs (révision %s, "
+                    "confiance %.2f sur %s bloc(s))",
                     doc_id,
                     page.page_number,
                     result.duration_seconds,
                     revision,
+                    aggregate_page_score(blocks),
+                    len(blocks),
                 )
 
             document.status = DocumentStatus.AWAITING_VALIDATION

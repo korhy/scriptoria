@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     # Doit rester aligné avec le mapping dense_vector de l'index.
     embedding_dim: int = 1024
 
+    # --- Confiance : double passage sélectif --------------------------------
+    # Un second passage coûte ~57 s de plus par page. Il n'est déclenché que sur
+    # les pages dont les contrôles gratuits (cohérence arithmétique, structure)
+    # ont déjà fait tomber le score sous ce seuil. À 0.0, jamais de second passage.
+    confidence_second_pass_threshold: float = 0.5
+    # Non nulle, et c'est indispensable : à température 0 le modèle redonnerait
+    # mot pour mot la même sortie, et la divergence ne mesurerait rien.
+    confidence_second_pass_temperature: float = 0.4
+
     api_base_url: str = "http://api:8000"
 
     @property

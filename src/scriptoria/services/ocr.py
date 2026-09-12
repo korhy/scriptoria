@@ -83,6 +83,7 @@ async def transcribe_page(
     image_path: Path,
     model: str,
     prompt: str | None = None,
+    temperature: float = 0.0,
 ) -> OcrResult:
     """Retranscrit une image de page en Markdown structuré.
 
@@ -91,6 +92,9 @@ async def transcribe_page(
         image_path: image à transcrire, de préférence déjà prétraitée.
         model: modèle vision Ollama, p.ex. `qwen2.5vl:7b`.
         prompt: consigne de transcription ; une consigne par défaut si absente.
+        temperature: nulle par défaut — une transcription n'est pas une rédaction.
+            Seul le second passage de mesure de confiance la relève, faute de quoi
+            le modèle redonnerait mot pour mot la même sortie.
 
     Raises:
         OcrError: image illisible, Ollama en erreur, ou réponse vide. Une
@@ -110,7 +114,7 @@ async def transcribe_page(
         # Sans cela Ollama répond en flux de JSON ligne à ligne.
         "stream": False,
         # Une transcription n'est pas une rédaction : aucune place pour l'invention.
-        "options": {"temperature": 0},
+        "options": {"temperature": temperature},
     }
 
     started = time.perf_counter()

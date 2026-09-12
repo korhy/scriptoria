@@ -18,6 +18,7 @@ import pytest
 from scriptoria.config import Settings
 from scriptoria.db.models import Document, Job, Page, Transcription
 from scriptoria.domain.enums import DocumentStatus, JobStatus, TranscriptionOrigin
+from scriptoria.services.confidence import METHOD_ARITHMETIC, METHOD_DOUBLE_PASS
 from scriptoria.services.ocr import OcrError, OcrResult
 from scriptoria.workers.tasks import transcribe_document
 
@@ -279,3 +280,107 @@ async def test_l_absence_de_job_en_base_n_empeche_pas_la_transcription(
     await transcribe_document(contexte, str(contexte["document"].id))
 
     assert len(contexte["session"].transcriptions) == 2
+
+
+# --- Confiance --------------------------------------------------------------
+
+# Une ligne arithmétiquement fausse : 6 x 28,60 = 171,60, pas 173,40.
+PAGE_DOUTEUSE = (
+    "| Désignation | Qté | PU HT | Total HT |\n"
+    "|---|---|---|---|\n"
+    "| Papier | 24 | 4,50 | 108,00 |\n"
+    "| Encre | 6 | 28,60 | 173,40 |\n"
+)
+
+
+@pytest.fixture
+def passages_simules(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Retient chaque appel vision, température comprise, et rend une page douteuse."""
+    appels: list[dict[str, Any]] = []
+
+    async def faux_transcribe_page(
+        client: Any, image_path: Path, model: str, temperature: float = 0.0, **kwargs: Any
+    ) -> OcrResult:
+        appels.append({"image": image_path, "temperature": temperature})
+        # Le second passage lit 28,90 là où le premier lisait 28,60 : divergence.
+        markdown = PAGE_DOUTEUSE
+        if temperature > 0:
+            markdown = PAGE_DOUTEUSE.replace("28,60", "28,90")
+        return OcrResult(content_markdown=markdown, model_name=model, duration_seconds=57.0)
+
+    monkeypatch.setattr("scriptoria.workers.tasks.transcribe_page", faux_transcribe_page)
+    return appels
+
+
+async def test_les_blocs_de_confiance_sont_enregistres_avec_la_revision(
+    contexte: dict[str, Any], passages_simules: list[dict[str, Any]]
+) -> None:
+    """Sans blocs en base, l'UI de validation n'a rien à surligner."""
+    contexte["session"].pages = [page(1, contexte["document"].id)]
+
+    await transcribe_document(contexte, str(contexte["document"].id))
+
+    revision = contexte["session"].transcriptions[0]
+    assert revision.confidence_blocks, "aucun bloc de confiance enregistré"
+    assert METHOD_ARITHMETIC in {bloc.method for bloc in revision.confidence_blocks}
+
+
+async def test_une_page_propre_ne_coute_qu_un_passage(
+    contexte: dict[str, Any], transcriptions_simulees: list[Path]
+) -> None:
+    """Le double passage systématique coûterait 6 h sur 200 pages au lieu de 3."""
+    await transcribe_document(contexte, str(contexte["document"].id))
+
+    assert len(transcriptions_simulees) == 2, "un passage par page, pas deux"
+
+
+async def test_une_page_douteuse_declenche_un_second_passage(
+    contexte: dict[str, Any], passages_simules: list[dict[str, Any]]
+) -> None:
+    """C'est là que la dépense se justifie : sur les pages qui échouent aux contrôles."""
+    contexte["session"].pages = [page(1, contexte["document"].id)]
+
+    await transcribe_document(contexte, str(contexte["document"].id))
+
+    assert len(passages_simules) == 2
+    # À température nulle, le modèle redonnerait mot pour mot la même sortie :
+    # la divergence ne mesurerait rien.
+    assert passages_simules[1]["temperature"] > 0
+
+
+async def test_la_divergence_entre_passages_est_enregistree(
+    contexte: dict[str, Any], passages_simules: list[dict[str, Any]]
+) -> None:
+    contexte["session"].pages = [page(1, contexte["document"].id)]
+
+    await transcribe_document(contexte, str(contexte["document"].id))
+
+    revision = contexte["session"].transcriptions[0]
+    assert METHOD_DOUBLE_PASS in {bloc.method for bloc in revision.confidence_blocks}
+
+
+async def test_la_revision_conservee_est_celle_du_premier_passage(
+    contexte: dict[str, Any], passages_simules: list[dict[str, Any]]
+) -> None:
+    """Le premier passage est à température nulle : c'est le plus fidèle des deux."""
+    contexte["session"].pages = [page(1, contexte["document"].id)]
+
+    await transcribe_document(contexte, str(contexte["document"].id))
+
+    assert "28,60" in contexte["session"].transcriptions[0].content_markdown
+
+
+async def test_un_seuil_a_zero_desactive_le_second_passage(
+    contexte: dict[str, Any], passages_simules: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    """Levier d'exploitation : un lot urgent doit pouvoir renoncer au second passage."""
+    contexte["settings"] = Settings(
+        data_dir=tmp_path,
+        ollama_vision_model=MODELE,
+        confidence_second_pass_threshold=0.0,
+    )
+    contexte["session"].pages = [page(1, contexte["document"].id)]
+
+    await transcribe_document(contexte, str(contexte["document"].id))
+
+    assert len(passages_simules) == 1

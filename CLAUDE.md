@@ -115,9 +115,9 @@ POST /documents → images écrites → job arq → worker → prétraitement �
 POST /documents/{id}/transcribe → job arq → worker → OCR page par page → AWAITING_VALIDATION
 ```
 
-**Implémenté** : import multipart (une image par page), stockage, prétraitement OpenCV, worker arq, suivi d'état et de jobs, accès aux images brutes et prétraitées, **OCR vision** (`services/ocr.py`, tâche `transcribe_document`, route `POST /documents/{id}/transcribe`).
+**Implémenté** : import multipart (une image par page), stockage, prétraitement OpenCV, worker arq, suivi d'état et de jobs, accès aux images brutes et prétraitées, **OCR vision** (`services/ocr.py`, tâche `transcribe_document`, route `POST /documents/{id}/transcribe`), **confiance** (`services/confidence.py`, `services/markdown_tables.py`, blocs persistés par révision).
 
-**Pas implémenté** : confiance, validation humaine, chunking, embeddings, indexation, recherche, UI de validation. Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
+**Pas implémenté** : validation humaine, chunking, embeddings, indexation, recherche, UI de validation. Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
 
 Deux conventions à respecter en poursuivant :
 
@@ -177,9 +177,43 @@ Diviser la résolution divise le temps par deux. **Mais l'erreur à 900 px est u
 2. **Le double passage coûterait ~114 s/page.** L'hypothèse par défaut pour la confiance devient discutable : sur un lot de 200 pages, cela fait 6 h au lieu de 3. Envisager un double passage *sélectif*, déclenché uniquement sur les pages dont le score déclaratif est faible.
 3. **Un lot se compte en heures, pas en minutes.** Le worker doit remonter une progression par page et être reprenable : un traitement de 200 pages qui échoue à la 180ᵉ sans reprise possible est inexploitable.
 
+### Confiance : tranché le 2026-09-12 — signaux objectifs d'abord
+
+Le double passage systématique est écarté comme méthode par défaut (~114 s/page,
+6 h pour 200 pages). Trois méthodes coexistent dans `confidence_blocks.method` :
+
+| `method` | Coût | Ce qu'elle attrape |
+|---|---|---|
+| `arithmetic` | nul | Ligne dont quantité x PU ne donne pas le total ; total qu'aucune somme de lignes ne justifie |
+| `structural` | nul | Cellule vide, ligne plus courte que l'en-tête, `[illisible]`, caractère de remplacement |
+| `double_pass` | ~57 s/page | Divergence entre deux lectures — **déclenché uniquement** sous `CONFIDENCE_SECOND_PASS_THRESHOLD` |
+
+Le score déclaratif du modèle n'est pas utilisé : une cohérence arithmétique est
+une preuve là où un score est une opinion.
+
+**Vérifié sur la sortie réelle du modèle** (fixture `page-test.png`, 1600 px) :
+0 bloc sur la transcription correcte, 1 bloc `arithmetic` à 0,15 dès que `28,90`
+devient `28,60` — exactement la corruption silencieuse mesurée la veille.
+
+Deux points appris en implémentant, qui ne sont pas devinables :
+
+- **Un second passage à température 0 ne mesure rien.** Le modèle redonne mot
+  pour mot la même sortie. D'où `CONFIDENCE_SECOND_PASS_TEMPERATURE=0.4` : sans
+  variation, la divergence est structurellement vide.
+- **Deux lectures d'une même page diffèrent par la mise en page** (`Échéance : 30
+  jours` puis `Échéance: 30 jours`, pipes alignés ou non). `compare_passes`
+  compare donc le texte hors espaces, sinon la base se remplit de blocs sans
+  contenu. En revanche une divergence portant sur des **chiffres** est plafonnée
+  à 0,2 même quand les deux lignes sont presque identiques : c'est tout le propos.
+
+Le score de page est le **minimum** des blocs, jamais leur moyenne — une moyenne
+noierait l'unique ligne fausse dans une page par ailleurs propre. Une page sans
+bloc vaut 1,0, ce qui veut dire « aucun signal d'alerte », pas « exacte » : un
+texte libre n'offre aucune prise à ces contrôles.
+
 **Non tranché — à décider par l'expérimentation, pas par principe :**
 
-- **Méthode de calcul de la confiance.** Voir le point 2 ci-dessus : le double passage systématique est coûteux au vu de la mesure. La colonne `confidence_blocks.method` existe pour comparer plusieurs méthodes sur les mêmes documents.
+- **Méthode de calcul de la confiance : tranchée le 2026-09-12**, voir ci-dessous. La colonne `confidence_blocks.method` reste là pour comparer les trois méthodes sur les mêmes documents — l'affaire n'est pas close, seulement instruite.
 - **Granularité du chunking** (par page ? par section détectée ?). Dépend de la qualité du balisage Markdown produit par l'OCR. Premier signal encourageant sur la fixture, mais un document réel dégradé dira autre chose.
 
 ---
