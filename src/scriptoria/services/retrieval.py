@@ -141,18 +141,37 @@ async def hybrid_search(
     return [replace(chunks[chunk_id], score=score) for chunk_id, score in ordered]
 
 
-def build_answer_context(chunks: list[RetrievedChunk]) -> dict[str, Any]:
+PASSAGE_COUPE = "[passage coupé : trop long pour le contexte du modèle]"
+_SEPARATEUR = "\n\n"
+
+
+def build_answer_context(chunks: list[RetrievedChunk], *, max_chars: int) -> dict[str, Any]:
     """Prépare le contexte transmis au LLM de génération.
 
     Chaque passage est numéroté et **rattaché à sa page** : une réponse dont on
     ne peut pas remonter à la page source est invérifiable, ce qui est
     inacceptable pour un fonds documentaire dont l'OCR peut se tromper.
 
+    Les passages sont retenus **dans l'ordre du classement** tant qu'ils tiennent
+    dans `max_chars` (voir `generation.context_budget`) ; le premier qui déborde
+    arrête la liste, sans céder sa place à un suivant plus court. Seul le meilleur
+    passage est coupé s'il ne tient pas seul, et la coupure est écrite. `sources`
+    ne rend que les passages transmis : une page que le modèle n'a pas lue ne
+    peut pas fonder sa réponse.
+
     Fonction synchrone, contrairement au stub d'origine : elle ne fait que du
     formatage, et l'annoncer `async` laisserait croire à une I/O.
     """
-    passages = [
-        f"[{position}] page {chunk.page_number} du document {chunk.document_id}\n{chunk.content}"
-        for position, chunk in enumerate(chunks, start=1)
-    ]
-    return {"context": "\n\n".join(passages), "sources": chunks}
+    passages: list[str] = []
+    longueur = 0
+    for position, chunk in enumerate(chunks, start=1):
+        entete = f"[{position}] page {chunk.page_number} du document {chunk.document_id}"
+        passage = f"{entete}\n{chunk.content}"
+        ajout = len(passage) + (len(_SEPARATEUR) if passages else 0)
+        if longueur + ajout > max_chars:
+            if not passages:
+                passages.append(passage[: max_chars - len(PASSAGE_COUPE)] + PASSAGE_COUPE)
+            break
+        passages.append(passage)
+        longueur += ajout
+    return {"context": _SEPARATEUR.join(passages), "sources": chunks[: len(passages)]}

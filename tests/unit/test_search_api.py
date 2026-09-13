@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from scriptoria.api.deps import get_es, get_ollama
+from scriptoria.config import Settings, get_settings
 
 DOCUMENT_ID = str(uuid4())
 REPONSE_GENEREE = "L'encre coûte 28,90 € l'unité [1]."
@@ -148,6 +149,34 @@ def test_sans_passage_aucun_modele_de_generation_n_est_charge(app: FastAPI) -> N
     assert corps["sources"] == []
     assert corps["answer"]
     assert endpoints == ["/api/embed"], "la génération a été appelée pour rien"
+
+
+def test_seules_les_pages_lues_par_le_modele_sont_rendues_comme_sources(app: FastAPI) -> None:
+    """Les passages qui ne tiennent pas dans le contexte ne sont pas transmis ; les
+    rendre comme sources ferait croire la réponse adossée à des pages non lues."""
+    generations: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/embed":
+            return httpx.Response(200, json={"embeddings": [[0.1] * 1024]})
+        generations.append(json.loads(request.read()))
+        return httpx.Response(200, json={"response": REPONSE_GENEREE})
+
+    ollama = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ollama-simule"
+    )
+    pages = [hit(f"{DOCUMENT_ID}:{n}", page=n, content="x" * 2000) for n in (1, 2, 3)]
+    reglages = Settings(ollama_generation_num_ctx=2048, ollama_generation_num_predict=256)
+    app.dependency_overrides[get_es] = lambda: FakeEs(hits=pages)
+    app.dependency_overrides[get_ollama] = lambda: ollama
+    app.dependency_overrides[get_settings] = lambda: reglages
+    client = TestClient(app, raise_server_exceptions=False)
+
+    corps = client.post("/search/answer", json={"query": "Combien ?", "top_k": 3}).json()
+
+    assert generations[0]["options"]["num_ctx"] == 2048
+    assert generations[0]["options"]["num_predict"] == 256
+    assert [source["page_number"] for source in corps["sources"]] == [1]
 
 
 # --- Pannes : jamais confondues avec une absence de résultat -----------------

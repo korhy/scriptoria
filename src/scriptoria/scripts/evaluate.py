@@ -39,7 +39,7 @@ from scriptoria.evaluation.questions import rang_premiere_page, reponse_contient
 from scriptoria.evaluation.rapport import ResultatQuestion, construire_rapport, rapport_markdown
 from scriptoria.services.chunking import chunk_markdown
 from scriptoria.services.embeddings import embed_texts
-from scriptoria.services.generation import generate_answer
+from scriptoria.services.generation import context_budget, generate_answer
 from scriptoria.services.indexing import ensure_index, index_chunks, validate_embedding_dim
 from scriptoria.services.preprocessing import PreprocessingOptions
 from scriptoria.services.retrieval import build_answer_context, hybrid_search
@@ -208,12 +208,19 @@ async def interroger(
                 zip(corpus.questions, passages, strict=True)
             ):
                 if trouves:
-                    contexte = build_answer_context(trouves[:TOP_K_REPONSE])
+                    num_ctx = settings.ollama_generation_num_ctx
+                    num_predict = settings.ollama_generation_num_predict
+                    contexte = build_answer_context(
+                        trouves[:TOP_K_REPONSE],
+                        max_chars=context_budget(question.question, num_ctx, num_predict),
+                    )
                     reponses[position] = await generate_answer(
                         ollama,
                         question.question,
                         contexte["context"],
                         settings.ollama_generation_model,
+                        num_ctx=num_ctx,
+                        num_predict=num_predict,
                     )
                 print(f"  … réponse {position + 1}/{len(corpus.questions)}")
 
@@ -249,6 +256,8 @@ def configuration(
         "modele_vision": settings.ollama_vision_model,
         "modele_embeddings": settings.ollama_embedding_model,
         "modele_generation": settings.ollama_generation_model,
+        "generation_num_ctx": settings.ollama_generation_num_ctx,
+        "generation_num_predict": settings.ollama_generation_num_predict,
         "pretraitement": asdict(PreprocessingOptions()),
         "seuil_second_passage": settings.confidence_second_pass_threshold,
         "index_evaluation": nom_index_evaluation(settings, corpus),

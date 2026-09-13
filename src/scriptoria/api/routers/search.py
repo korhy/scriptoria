@@ -21,7 +21,7 @@ from scriptoria.api.deps import AppSettings, EsClient, OllamaClient
 from scriptoria.config import Settings
 from scriptoria.schemas.search import AnswerResponse, SearchHit, SearchQuery, SearchResponse
 from scriptoria.services.embeddings import EmbeddingError, embed_texts
-from scriptoria.services.generation import GenerationError, generate_answer
+from scriptoria.services.generation import GenerationError, context_budget, generate_answer
 from scriptoria.services.retrieval import RetrievedChunk, build_answer_context, hybrid_search
 
 logger = logging.getLogger(__name__)
@@ -110,15 +110,25 @@ async def answer(
         logger.info("aucun passage pour « %s » — génération évitée", payload.query)
         return AnswerResponse(answer=NO_PASSAGE_ANSWER, sources=[])
 
-    context = build_answer_context(chunks)
+    num_ctx = settings.ollama_generation_num_ctx
+    num_predict = settings.ollama_generation_num_predict
+    context = build_answer_context(
+        chunks, max_chars=context_budget(payload.query, num_ctx, num_predict)
+    )
     try:
         generated = await generate_answer(
             ollama,
             payload.query,
             context["context"],
             settings.ollama_generation_model,
+            num_ctx=num_ctx,
+            num_predict=num_predict,
         )
     except GenerationError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
-    return AnswerResponse(answer=generated, sources=[_to_hit(chunk) for chunk in chunks])
+    # Seuls les passages transmis au modèle : une page qu'il n'a pas lue ne peut
+    # pas fonder sa réponse.
+    return AnswerResponse(
+        answer=generated, sources=[_to_hit(chunk) for chunk in context["sources"]]
+    )

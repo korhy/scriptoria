@@ -8,6 +8,7 @@ La fusion côté Python n'est pas un plan de repli : c'est le chemin réel. Le
 import pytest
 
 from scriptoria.services.retrieval import (
+    PASSAGE_COUPE,
     RetrievedChunk,
     build_answer_context,
     hybrid_search,
@@ -159,7 +160,7 @@ def test_le_contexte_cite_la_page_de_chaque_passage() -> None:
         )
     ]
 
-    contexte = build_answer_context(chunks)
+    contexte = build_answer_context(chunks, max_chars=10_000)
 
     assert "page 1" in contexte["context"]
     assert "Total HT | 311,40" in contexte["context"]
@@ -168,7 +169,50 @@ def test_le_contexte_cite_la_page_de_chaque_passage() -> None:
 
 def test_un_contexte_sans_passage_est_vide_et_le_dit() -> None:
     """Mieux vaut un contexte vide qu'un contexte inventé pour faire nombre."""
-    contexte = build_answer_context([])
+    contexte = build_answer_context([], max_chars=10_000)
 
     assert contexte["context"] == ""
     assert contexte["sources"] == []
+
+
+def passage(page: int, taille: int) -> RetrievedChunk:
+    return RetrievedChunk(
+        chunk_id=f"doc:{page}",
+        document_id="b522c30f-a742-4f09-a793-9b0f12bf8d23",
+        page_number=page,
+        content=str(page) * taille,
+        score=1.0 / page,
+    )
+
+
+def test_les_passages_sont_retenus_dans_l_ordre_tant_qu_ils_tiennent() -> None:
+    """Au-delà, Ollama couperait le prompt par le début : règles et meilleurs
+    passages perdus, sans erreur. Mieux vaut transmettre moins, mais entier."""
+    chunks = [passage(1, 400), passage(2, 400), passage(3, 400)]
+
+    contexte = build_answer_context(chunks, max_chars=1000)
+
+    assert len(contexte["context"]) <= 1000
+    assert contexte["sources"] == chunks[:2]
+    assert "[2] page 2" in contexte["context"]
+    assert "page 3" not in contexte["context"]
+
+
+def test_un_passage_qui_ne_tient_pas_n_est_pas_remplace_par_un_suivant_plus_court() -> None:
+    """Glisser le quatrième à la place du troisième brouillerait le classement."""
+    chunks = [passage(1, 400), passage(2, 900), passage(3, 10)]
+
+    contexte = build_answer_context(chunks, max_chars=1000)
+
+    assert contexte["sources"] == chunks[:1]
+
+
+def test_un_premier_passage_trop_long_est_coupe_et_le_dit() -> None:
+    """Le meilleur passage n'est jamais écarté, mais sa coupure est visible."""
+    chunks = [passage(1, 5000), passage(2, 10)]
+
+    contexte = build_answer_context(chunks, max_chars=1000)
+
+    assert len(contexte["context"]) <= 1000
+    assert contexte["context"].endswith(PASSAGE_COUPE)
+    assert contexte["sources"] == chunks[:1]

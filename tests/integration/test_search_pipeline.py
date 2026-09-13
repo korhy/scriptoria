@@ -14,6 +14,7 @@ sources, une réponse non vide, une consigne non suivie). Exiger une formulation
 précise d'un modèle rendrait la série instable sans rien prouver de plus.
 """
 
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -122,6 +123,60 @@ def test_la_reponse_generee_vient_avec_ses_sources(
     assert corps["answer"].strip()
     assert corps["sources"], "une réponse sans source est invérifiable"
     assert all(source["page_number"] >= 1 for source in corps["sources"])
+
+
+PHRASES_NEUTRES = (
+    "Les registres sont rangés par ordre chronologique dans les armoires du fond.",
+    "Chaque consultation est notée dans le cahier tenu à l'accueil de la salle.",
+    "Les documents fragiles ne quittent jamais la salle de lecture.",
+    "Le dépoussiérage des rayonnages a lieu au début de chaque saison.",
+    "Les cotes anciennes restent inscrites à côté des cotes actuelles.",
+)
+
+
+def remplissage(taille: int) -> str:
+    """Texte neutre, sans chiffre, pour allonger une page sans lui ajouter de fait."""
+    phrases: list[str] = []
+    while sum(len(phrase) + 1 for phrase in phrases) < taille:
+        phrases.append(PHRASES_NEUTRES[len(phrases) % len(PHRASES_NEUTRES)])
+    return " ".join(phrases)
+
+
+def test_la_reponse_tient_compte_du_debut_d_un_passage_long(
+    api: httpx.Client, creer_document_indexe
+) -> None:
+    """Défaut mesuré le 2026-09-13 sur un acte de 44 pages : un prompt qui dépasse
+    `num_ctx` (4 096 jetons par défaut) est ramené par Ollama à ~2 050 jetons pris
+    sur la fin. Règles et meilleurs passages disparaissent, sans erreur.
+
+    La page seule dépasse donc 4 096 jetons (~16 000 caractères), et le fait cherché
+    l'ouvre : sans fenêtre fixée ni passages limités, il est perdu à coup sûr.
+    Vérifié : à 9 000 caractères, l'ancien code répondait juste — la page tenait.
+    """
+    reference = f"REF-{uuid4().hex[:8].upper()}"
+    feuillets = 100 + uuid4().int % 800
+    document = creer_document_indexe(
+        f"REGISTRE {reference}\n\nLe registre {reference} compte {feuillets} feuillets.\n\n"
+        + remplissage(16_000),
+        nom="registre.png",
+    )
+    try:
+        response = api.post(
+            "/search/answer",
+            json={"query": f"Combien de feuillets compte le registre {reference} ?", "top_k": 3},
+        )
+    finally:
+        # Des registres presque identiques s'accumuleraient d'une série à l'autre et
+        # se disputeraient la première place du classement.
+        api.delete(f"/documents/{document['document_id']}")
+
+    assert response.status_code == 200, response.text
+    corps = response.json()
+    assert any(reference in source["content"] for source in corps["sources"]), (
+        "le registre n'a pas été transmis au modèle : l'épreuve ne vaut rien"
+    )
+    # Nombre isolé : trois chiffres se trouvent aussi dans un identifiant recopié.
+    assert re.search(rf"(?<!\d){feuillets}(?!\d)", corps["answer"]), corps["answer"]
 
 
 # --- Injection par le contenu -----------------------------------------------

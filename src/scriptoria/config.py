@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     ollama_vision_model: str = "qwen2.5vl:7b"
     ollama_embedding_model: str = "bge-m3"
     ollama_generation_model: str = "mistral:latest"
+    # Fenêtre de génération fixée explicitement : sans elle, Ollama s'en tient à
+    # 4 096 jetons et coupe le début d'un prompt trop long (règles et meilleurs
+    # passages) sans erreur. Mesuré le 2026-09-13.
+    ollama_generation_num_ctx: int = 8192
+    # Longueur maximale de la réponse, réservée dans la fenêtre.
+    ollama_generation_num_predict: int = 512
     # L'OCR vision d'une page peut dépasser la minute sur un M4.
     ollama_timeout_seconds: float = 300.0
     # Doit rester aligné avec le mapping dense_vector de l'index.

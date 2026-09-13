@@ -476,8 +476,8 @@ casse un total.
   du prompt : `SYSTEM_RULES` (dont la consigne anti-injection) et les premiers
   passages disparaissent. Les réponses justes aux rangs 4-5 et fausses au rang 1
   en sont la signature. Le test d'intégration d'injection ne le voit pas : sa page
-  unique est courte. **Défaut de `/search/answer`, pas du harnais — à corriger
-  avant tout autre réglage de la recherche.**
+  unique est courte. **Défaut de `/search/answer`, pas du harnais — corrigé le
+  jour même**, voir « Génération : fenêtre fixée » ci-dessous.
 - **Tantièmes du lot 37 : échec de recherche**, la page 28 hors des 10 premiers
   alors que l'OCR y lit bien `44/2.000`. Quatre pages de tables quasi identiques
   en un fragment chacune : premier indice contre le découpage par page.
@@ -485,9 +485,54 @@ casse un total.
   swap pleins (`fseventsd` à 16 Go, Kibana et d'autres projets démarrés). Le
   coût d'un lot se mesure machine déchargée.
 
+### Génération : fenêtre fixée, passages limités (2026-09-13)
+
+**Règle mesurée sur Ollama** (`mistral:latest`, fenêtre par défaut 4 096) : un
+prompt qui **dépasse `num_ctx`** est ramené à ~2 050 jetons **pris sur la fin**
+(`truncating input prompt limit=2051 prompt=4120`), sans erreur dans la réponse
+HTTP. Un prompt de 4 059 jetons passe entier ; un de 4 120 perd sa moitié avant.
+Or le prompt commence par `SYSTEM_RULES` — consigne anti-injection comprise —
+puis par le passage le mieux classé.
+
+- **`num_ctx` et `num_predict` sont toujours transmis**
+  (`OLLAMA_GENERATION_NUM_CTX=8192`, `OLLAMA_GENERATION_NUM_PREDICT=512`), et
+  obligatoires dans `generate_answer` : un appel qui les oublie lève `TypeError`
+  au lieu de retomber sur 4 096.
+- **Les passages sont limités avant l'envoi** : `context_budget` = `(num_ctx −
+  num_predict) × 1,8` caractères, moins règles et question. Ratio pris sous le
+  **pire mesuré** sur les 44 pages du corpus : 1,95 caractère par jeton, une
+  table de tantièmes (moyenne 2,85). `build_answer_context` retient les passages
+  dans l'ordre du classement tant qu'ils tiennent ; le premier qui déborde arrête
+  la liste. Seul le meilleur passage est coupé s'il ne tient pas seul, et la
+  coupure est écrite dans le texte.
+- **Les sources rendues sont les passages transmis**, et non tous ceux que la
+  recherche a trouvés : une page que le modèle n'a pas lue ne peut pas fonder sa réponse.
+- **Un prompt qui dépasse malgré tout est refusé** (`GenerationError`, 503) plutôt
+  que confié à Ollama, qui le tronquerait en silence.
+
+**Vérifié** : `test_la_reponse_tient_compte_du_debut_d_un_passage_long` place le
+fait cherché en tête d'une page de ~16 000 caractères. **Ancien code : échec**
+(Ollama log `prompt=5355` tronqué, réponse tirée d'autres documents) ; **code
+corrigé : 6/6 sur `test_search_pipeline.py`**, test d'injection compris, et aucune
+troncature dans les logs. Une première version à 9 000 caractères passait sur
+l'ancien code : la page tenait dans 4 096 jetons. Le test supprime son document,
+sans quoi des registres presque identiques se disputeraient le classement.
+
+**Mesuré sur le corpus** (`make eval … DOCUMENT=…`, même OCR, même index) :
+réponses contenant la valeur attendue **6/13 → 10/13**, rappel inchangé. Notaire,
+date, assureur et heure de fermeture, perdus à la troncature, sont retrouvés.
+Restent faux : les tantièmes du lot 37 (page 28 hors des 10 premiers, défaut de
+recherche) et les occupants des lots 12 et 15. Pour ces derniers, l'OCR est juste :
+« Occupé par … » **suit** l'intitulé de chaque lot, et mistral retient la ligne qui
+le précède, celle du lot d'avant. Piste à mesurer, pas à supposer : un découpage
+par lot plutôt que par page.
+
+**Non vérifié** : le coût mémoire de 8 192 jetons de fenêtre, estimé à ~0,5 Go de
+cache de plus que 4 096 pour mistral 7B, sur une machine déjà à la limite.
+
 ### Tests d'intégration : ce qu'ils couvrent (2026-09-12)
 
-`tests/integration/` parle à la vraie stack. 25 tests, ~4 minutes, Ollama requis.
+`tests/integration/` parle à la vraie stack. 26 tests, ~4 minutes, Ollama requis.
 Ils existent parce que les tests unitaires remplacent Postgres, Elasticsearch et
 les modèles par des doubles : un champ mal nommé dans une requête ES, une
 dimension de vecteur désalignée ou une écriture qui duplique au lieu d'écraser
@@ -499,7 +544,7 @@ ne se voient que là.
 | `test_import_pipeline.py` | import → prétraitement, image source intacte |
 | `test_ocr_ollama.py` | la requête vision est bien celle qu'Ollama attend |
 | `test_validation_indexing.py` | révision `n+1` sans écrasement, fragment indexé (1024 dim), correction qui **remplace** le fragment, `reindex` idempotent |
-| `test_search_pipeline.py` | recherche hybride, réponse avec sources, **fausse consigne citée sans être exécutée** |
+| `test_search_pipeline.py` | recherche hybride, réponse avec sources, **fausse consigne citée sans être exécutée**, début d'un passage long conservé |
 | `test_document_deletion.py` | suppression complète (base par cascade, fragments ES, dossiers), job mort dans arq non bloquant |
 
 Deux règles apprises en les écrivant, à respecter pour en ajouter :

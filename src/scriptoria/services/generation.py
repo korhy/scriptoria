@@ -27,6 +27,11 @@ GENERATE_PATH = "/api/generate"
 # pas une rédaction libre.
 DEFAULT_TEMPERATURE = 0.2
 
+# Pire ratio mesuré avec mistral le 2026-09-13 sur un acte de 44 pages : 1,95
+# caractère par jeton, sur une table de tantièmes (moyenne : 2,85). La marge
+# couvre des pages plus denses encore en chiffres.
+CHARS_PER_TOKEN_MIN = 1.8
+
 SYSTEM_RULES = (
     "Tu réponds à une question en t'appuyant UNIQUEMENT sur les passages ci-dessous, "
     "extraits de documents papier numérisés.\n"
@@ -46,6 +51,31 @@ class GenerationError(RuntimeError):
     """La génération n'a pas abouti, ou sa sortie est vide."""
 
 
+def prompt_budget_chars(num_ctx: int, num_predict: int) -> int:
+    """Longueur maximale d'un prompt, en caractères, qu'Ollama ne tronquera pas.
+
+    Au-delà de sa fenêtre, Ollama ne lève aucune erreur : il garde la fin du
+    prompt et jette le début, c'est-à-dire les règles et les passages les mieux
+    classés. La réponse est rédigée quand même, sur ce qui reste.
+    """
+    return int((num_ctx - num_predict) * CHARS_PER_TOKEN_MIN)
+
+
+def context_budget(question: str, num_ctx: int, num_predict: int) -> int:
+    """Place laissée aux passages, une fois les règles et la question comptées.
+
+    Raises:
+        ValueError: réglages qui ne laissent aucune place aux passages.
+    """
+    budget = prompt_budget_chars(num_ctx, num_predict) - len(build_prompt(question, ""))
+    if budget <= 0:
+        raise ValueError(
+            f"num_ctx={num_ctx} et num_predict={num_predict} ne laissent aucune place "
+            "aux passages : augmenter OLLAMA_GENERATION_NUM_CTX."
+        )
+    return budget
+
+
 def build_prompt(question: str, context: str) -> str:
     """Assemble la consigne, les passages et la question.
 
@@ -62,18 +92,31 @@ async def generate_answer(
     context: str,
     model: str,
     temperature: float = DEFAULT_TEMPERATURE,
+    *,
+    num_ctx: int,
+    num_predict: int,
 ) -> str:
     """Rédige une réponse adossée aux passages fournis.
 
     Raises:
-        GenerationError: Ollama en erreur, ou réponse vide — rendre une réponse
-            vide laisserait croire que le fonds documentaire ne contient rien.
+        GenerationError: Ollama en erreur, réponse vide — rendre une réponse
+            vide laisserait croire que le fonds documentaire ne contient rien —,
+            ou prompt trop long pour la fenêtre, qu'Ollama tronquerait en silence.
     """
+    prompt = build_prompt(question, context)
+    limite = prompt_budget_chars(num_ctx, num_predict)
+    if len(prompt) > limite:
+        raise GenerationError(
+            f"prompt trop long pour num_ctx={num_ctx} : {len(prompt)} caractères pour "
+            f"{limite} au plus. Ollama en couperait le début sans erreur ; limiter les "
+            "passages avec context_budget."
+        )
+
     payload = {
         "model": model,
-        "prompt": build_prompt(question, context),
+        "prompt": prompt,
         "stream": False,
-        "options": {"temperature": temperature},
+        "options": {"temperature": temperature, "num_ctx": num_ctx, "num_predict": num_predict},
     }
 
     try:
