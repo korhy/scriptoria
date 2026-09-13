@@ -353,6 +353,69 @@ retiré ; un job `running` inconnu d'arq ne bloque pas (vrai Redis) ; seconde
 suppression ⇒ 404. `remove_document_files` ignore les erreurs disque : un dossier
 qui résisterait resterait orphelin sans le signaler.
 
+### UI : Documents, Validation, Recherche (2026-09-13)
+
+L'UI Streamlit passe d'une vue unique à trois pages (`st.navigation`) :
+**Documents** (import, suivi, lancer/relancer l'OCR, relire, supprimer),
+**Validation** (inchangée sur le fond) et **Recherche** (passages ou réponse
+rédigée, chaque source menant à sa page).
+
+- **L'image `ui` ne copie que `src/scriptoria/ui/`** : l'UI n'importe rien de
+  `scriptoria`. Les modules se chargent à plat (`import presentation`).
+- **Ce qui s'affiche se décide dans `ui/presentation.py`**, sans Streamlit ni
+  httpx : testé dans le conteneur `api` et compté dans la couverture. Les pages
+  restent minces et sont vérifiées dans un navigateur.
+- **Passages et réponse s'affichent en texte brut**, jamais en Markdown : un
+  `![](http://…)` venu d'une page scannée ferait charger une URL externe.
+- **Sélection par identifiant, et clé de widget dérivée de la liste**
+  (`cle_widget`). Sous une clé inchangée, après une suppression, Streamlit gardait
+  le libellé du document supprimé pendant que le panneau agissait sur un autre —
+  vu dans le navigateur, et c'est le risque de supprimer le mauvais document.
+- **Le tableau se rafraîchit seul** tant qu'un document est en travail, et 30 s
+  après un envoi d'OCR (le worker ne le prend pas à l'instant) ; un changement de
+  statut relance la page entière pour que le panneau d'actions suive.
+
+**Défauts trouvés en déroulant l'UI, corrigés :**
+
+1. **Streamlit envoyait des statistiques d'usage à un tiers** (`POST
+   webhooks.fivetran.com` à chaque interaction) — une entorse à la règle zéro
+   réseau externe, antérieure à cette branche. Désactivé par
+   `src/scriptoria/ui/.streamlit/config.toml` (lu parce que le conteneur lance
+   Streamlit depuis ce répertoire), gardé par
+   `test_config.py::test_l_ui_n_envoie_aucune_statistique_d_usage`. Vérifié dans
+   une session neuve : plus aucune requête hors `localhost`.
+2. **Un OCR pouvait être envoyé deux fois** pour un document `preprocessed` : le
+   garde-fou ne couvrait que la relance depuis `failed`. Un doublon remettrait le
+   document en `awaiting_validation` même validé entre-temps. `POST /transcribe`
+   refuse désormais (409) dès qu'arq tient un OCR du document, quel que soit son
+   statut. Vérifié sur la stack : 202 puis 409 « un OCR est déjà 'queued' ».
+3. **Streamlit cherchait son adresse publique** au démarrage, en interrogeant
+   `checkip.amazonaws.com` depuis le conteneur (`External URL: …` dans les logs).
+   Évité en fixant `browser.serverAddress = "localhost"` dans le même fichier de
+   configuration, gardé par `test_l_ui_ne_cherche_pas_son_adresse_publique`.
+4. **Des libellés identiques masquaient le document visé** : treize
+   « correction.png — 1 p. — indexé » dans la liste d'actions, et une suppression
+   a porté sur un autre `correction.png` que celui qu'on croyait sélectionné.
+   L'application a supprimé le document sélectionné ; c'est l'écran qui ne
+   permettait pas de savoir lequel c'était. `libelle_document` porte désormais la
+   date d'import et un identifiant court.
+
+`use_container_width`, déprécié par Streamlit, est remplacé par `width="stretch"`.
+
+Vérifié après correction : les logs de démarrage n'affichent plus que
+`URL: http://localhost:8501`, sans « External URL » ; la suppression du premier
+document (`… · 26b402a4`) a bien porté sur lui (log de l'API), et la liste est
+passée au suivant (`… · c800b60c`), cohérente avec le panneau et le tableau.
+
+Parcours vérifiés dans le navigateur : import (ordre naturel des pages), OCR
+lancé et suivi jusqu'à « à valider », « Relire » et « Ouvrir la page » menant à la
+bonne page, recherche en passages et en réponse rédigée (sources numérotées
+comme les renvois), suppression confirmée.
+
+**Point de vigilance** : le conteneur `api` embarque `pyproject.toml` à la
+construction. Toute modification de la configuration de couverture ou de ruff
+demande `docker compose up -d --build api` pour prendre effet dans `make test`.
+
 ### Tests d'intégration : ce qu'ils couvrent (2026-09-12)
 
 `tests/integration/` parle à la vraie stack. 25 tests, ~4 minutes, Ollama requis.

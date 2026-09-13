@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from scriptoria.api.deps import get_db, get_queue
+from scriptoria.api.routers import documents as documents_router
 from scriptoria.db.models import Document, Job
 from scriptoria.domain.enums import DocumentStatus, JobStatus
 
@@ -203,3 +204,59 @@ def test_une_relance_deja_en_file_n_est_pas_doublee(
 
     assert response.status_code == 409
     assert queue.enqueued == []
+
+
+# --- Doublon depuis un document prétraité -----------------------------------
+
+
+@pytest.fixture
+def jobs_arq_actifs(monkeypatch: pytest.MonkeyPatch) -> set[str]:
+    """Identifiants que arq déclare encore en file ou en cours."""
+    actifs: set[str] = set()
+
+    async def faux_etat(queue: Any, arq_job_id: str | None) -> bool:
+        return arq_job_id in actifs
+
+    monkeypatch.setattr(documents_router, "_arq_job_active", faux_etat)
+    return actifs
+
+
+def test_un_ocr_deja_en_file_n_est_pas_double_depuis_un_document_pretraite(
+    contexte: tuple[TestClient, FakeQueue, FakeSession],
+    document: Document,
+    jobs_arq_actifs: set[str],
+) -> None:
+    """Le worker ne prend pas un job à l'instant : le document reste `preprocessed`.
+
+    Vu dans l'UI le 2026-09-13 : juste après l'envoi, « Lancer l'OCR » restait
+    cliquable. Un second OCR sauterait les pages, mais remettrait le document en
+    `awaiting_validation` — même s'il avait été validé entre-temps.
+    """
+    client, queue, session = contexte
+    session.dernier_job = Job(
+        document_id=document.id, kind="transcribe", status=JobStatus.QUEUED, arq_job_id="job-1"
+    )
+    jobs_arq_actifs.add("job-1")
+
+    response = client.post(f"/documents/{document.id}/transcribe")
+
+    assert response.status_code == 409
+    assert "déjà" in response.json()["detail"]
+    assert queue.enqueued == []
+
+
+def test_un_ocr_marque_en_file_mais_mort_dans_arq_ne_bloque_pas(
+    contexte: tuple[TestClient, FakeQueue, FakeSession],
+    document: Document,
+    jobs_arq_actifs: set[str],
+) -> None:
+    """Une ligne `queued` que arq ne connaît plus ne doit pas rendre l'OCR impossible."""
+    client, queue, session = contexte
+    session.dernier_job = Job(
+        document_id=document.id, kind="transcribe", status=JobStatus.QUEUED, arq_job_id="job-mort"
+    )
+
+    response = client.post(f"/documents/{document.id}/transcribe")
+
+    assert response.status_code == 202, response.text
+    assert len(queue.enqueued) == 1

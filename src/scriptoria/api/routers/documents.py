@@ -77,21 +77,33 @@ async def _last_job(session: AsyncSession, document_id: UUID) -> Job | None:
     return result.scalar_one_or_none()
 
 
-def _relaunch_refusal(last_job: Job | None) -> str | None:
-    """Pourquoi un document en échec ne peut pas repartir en OCR — `None` s'il le peut.
+async def _ocr_refusal(document: Document, last_job: Job | None, queue: ArqRedis) -> str | None:
+    """Pourquoi l'OCR ne peut pas partir pour ce document — `None` s'il le peut.
 
-    Seul un OCR en échec se relance : après un prétraitement raté, l'OCR
-    transcrirait des images non nettoyées ; après une indexation ratée, c'est
-    l'indexation qu'il faut rejouer. Et une relance déjà en file ne se double pas.
+    - **Un OCR déjà en file ou en cours ne se double pas**, quel que soit le statut :
+      le worker ne prend pas un job à l'instant, et le document reste
+      `preprocessed` en attendant. Un doublon sauterait les pages, mais remettrait
+      le document en `awaiting_validation` même s'il a été validé entre-temps.
+      C'est arq qui dit ce qui tourne : une ligne `queued` morte ne bloque pas.
+    - **Seul un OCR en échec se relance** : après un prétraitement raté, l'OCR
+      transcrirait des images non nettoyées ; après une indexation ratée, c'est
+      l'indexation qu'il faut rejouer.
     """
+    if (
+        last_job is not None
+        and last_job.kind == "transcribe"
+        and last_job.status in (JobStatus.QUEUED, JobStatus.RUNNING)
+        and await _arq_job_active(queue, last_job.arq_job_id)
+    ):
+        return f"un OCR est déjà '{last_job.status.value}' pour ce document."
+    if document.status == DocumentStatus.PREPROCESSED:
+        return None
     if last_job is None:
         return "document en échec sans job enregistré : impossible de dire quelle étape relancer."
     if last_job.kind != "transcribe":
         return (
             f"l'échec vient de l'étape '{last_job.kind}' : seul un OCR en échec peut être relancé."
         )
-    if last_job.status != JobStatus.FAILED:
-        return f"un OCR est déjà '{last_job.status.value}' pour ce document."
     return None
 
 
@@ -375,16 +387,16 @@ async def transcribe_document(
     if document is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document introuvable")
 
-    if document.status == DocumentStatus.FAILED:
-        refusal = _relaunch_refusal(await _last_job(session, document_id))
-        if refusal is not None:
-            raise HTTPException(status.HTTP_409_CONFLICT, refusal)
-    elif document.status != DocumentStatus.PREPROCESSED:
+    if document.status not in (DocumentStatus.PREPROCESSED, DocumentStatus.FAILED):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             f"document en statut '{document.status.value}' : l'OCR attend un document "
             f"'{DocumentStatus.PREPROCESSED.value}'.",
         )
+
+    refusal = await _ocr_refusal(document, await _last_job(session, document_id), queue)
+    if refusal is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, refusal)
 
     job = await queue.enqueue_job(TRANSCRIBE_TASK, str(document_id))
     arq_job_id = getattr(job, "job_id", None)

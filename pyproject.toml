@@ -89,7 +89,9 @@ markers = [
 
 [tool.coverage.run]
 source = ["src/scriptoria"]
-omit = ["*/migrations/*", "*/ui/*"]
+# Les pages Streamlit sont vérifiées dans un navigateur ; la logique de
+# présentation (`ui/presentation.py`), elle, est testée et comptée.
+omit = ["*/migrations/*", "*/ui/streamlit_app.py", "*/ui/api_client.py", "*/ui/page_*.py"]
 
 [tool.coverage.report]
 show_missing = true

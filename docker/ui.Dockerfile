@@ -16,6 +16,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY src/scriptoria/ui/ ./src/scriptoria/ui/
 
+# Streamlit lit `.streamlit/config.toml` dans le répertoire courant : c'est là
+# qu'est désactivé l'envoi de statistiques d'usage à un service tiers.
+WORKDIR /app/src/scriptoria/ui
+
 EXPOSE 8501
-CMD ["streamlit", "run", "/app/src/scriptoria/ui/streamlit_app.py", \
+CMD ["streamlit", "run", "streamlit_app.py", \
      "--server.address=0.0.0.0", "--server.port=8501"]

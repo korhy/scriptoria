@@ -1,0 +1,15 @@
+# Réglages Streamlit de l'UI. Pris en compte parce que le conteneur lance
+# Streamlit depuis ce répertoire (voir docker/ui.Dockerfile).
+
+[browser]
+# Par défaut, Streamlit envoie des statistiques d'usage à un service tiers —
+# constaté le 2026-09-13 : des POST vers webhooks.fivetran.com à chaque
+# interaction. La stack est 100 % locale ; l'écran aussi.
+gatherUsageStats = false
+# Adresse fixée : sans elle, Streamlit interroge checkip.amazonaws.com au
+# démarrage pour afficher une « External URL » (constaté le 2026-09-13).
+serverAddress = "localhost"
+
+[client]
+# Masque le bouton « Deploy », qui renvoie vers le cloud de Streamlit.
+toolbarMode = "minimal"
