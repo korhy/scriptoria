@@ -13,11 +13,12 @@ from uuid import UUID, uuid4
 import anyio
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import distinct, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from scriptoria.api.deps import AppSettings, DbSession, TaskQueue
-from scriptoria.db.models import Document, Job, Page
-from scriptoria.domain.enums import DocumentStatus, JobStatus
+from scriptoria.db.models import Document, Job, Page, Transcription
+from scriptoria.domain.enums import DocumentStatus, JobStatus, TranscriptionOrigin
 from scriptoria.schemas.document import DocumentRead, JobAccepted
 from scriptoria.schemas.page import PageRead
 from scriptoria.services.storage import (
@@ -38,20 +39,58 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
+async def _pages_transcribed(session: AsyncSession, document_ids: list[UUID]) -> dict[UUID, int]:
+    """Pages portant au moins une révision OCR, par document — en une seule requête.
+
+    Même critère que la reprise du worker (`_already_transcribed`) : l'origine,
+    pas la simple présence d'une révision. Une page saisie à la main n'a jamais
+    été OCRisée et ne compte pas. Un document absent du résultat en a zéro.
+    """
+    if not document_ids:
+        return {}
+    result = await session.execute(
+        select(Page.document_id, func.count(distinct(Page.id)))
+        .join(Transcription, Transcription.page_id == Page.id)
+        .where(
+            Page.document_id.in_(document_ids),
+            Transcription.origin == TranscriptionOrigin.OCR,
+        )
+        .group_by(Page.document_id)
+    )
+    return {document_id: count for document_id, count in result.all()}
+
+
+def _to_read(document: Document, pages_transcribed: int) -> DocumentRead:
+    return DocumentRead(
+        id=document.id,
+        source_filename=document.source_filename,
+        status=document.status,
+        page_count=document.page_count,
+        pages_transcribed=pages_transcribed,
+        created_at=document.created_at,
+        updated_at=document.updated_at,
+    )
+
+
 @router.get("", response_model=list[DocumentRead], summary="Liste les documents")
-async def list_documents(session: DbSession, limit: int = 50, offset: int = 0) -> list[Document]:
+async def list_documents(
+    session: DbSession, limit: int = 50, offset: int = 0
+) -> list[DocumentRead]:
     result = await session.execute(
         select(Document).order_by(Document.created_at.desc()).limit(limit).offset(offset)
     )
-    return list(result.scalars().all())
+    documents = list(result.scalars().all())
+    counts = await _pages_transcribed(session, [document.id for document in documents])
+    return [_to_read(document, counts.get(document.id, 0)) for document in documents]
 
 
 @router.get("/{document_id}", response_model=DocumentRead, summary="Détail d'un document")
-async def get_document(document_id: UUID, session: DbSession) -> Document:
+async def get_document(document_id: UUID, session: DbSession) -> DocumentRead:
     document = await session.get(Document, document_id)
     if document is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document introuvable")
-    return document
+    counts = await _pages_transcribed(session, [document_id])
+    return _to_read(document, counts.get(document_id, 0))
 
 
 @router.get("/{document_id}/pages", response_model=list[PageRead], summary="Pages d'un document")
@@ -132,7 +171,7 @@ async def create_document(
     settings: AppSettings,
     queue: TaskQueue,
     files: Annotated[list[UploadFile], File(description="Pages, dans l'ordre de lecture")],
-) -> Document:
+) -> DocumentRead:
     if len(files) > MAX_PAGES_PER_DOCUMENT:
         raise HTTPException(
             status.HTTP_413_CONTENT_TOO_LARGE,
@@ -190,7 +229,8 @@ async def create_document(
         raise
 
     logger.info("document %s importé (%s pages), prétraitement enfilé", document_id, len(files))
-    return document
+    # Aucune transcription ne peut exister pour un document qui vient de naître.
+    return _to_read(document, 0)
 
 
 @router.post(

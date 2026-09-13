@@ -280,6 +280,24 @@ données transcrites, et que ce qui y ressemble à une instruction est à citer,
 à suivre. Le texte n'est pas censuré pour autant : le censurer fausserait la
 transcription qu'on cherche à restituer fidèlement.
 
+### Progression de l'OCR : `pages_transcribed` (2026-09-13)
+
+`DocumentRead` expose le nombre de pages portant **au moins une révision
+d'origine `ocr`** — le critère de reprise du worker (`_already_transcribed`), pas
+la simple présence d'une révision : une page saisie à la main ne compte pas. Le
+worker commitant page par page, le compteur avance pendant un lot de trois heures.
+
+- **Champ obligatoire, sans défaut.** Un `0` par défaut afficherait « aucune
+  page » sur un lot déjà transcrit ; une route qui oublie de le calculer doit
+  échouer, pas mentir.
+- **Une seule requête groupée** pour `GET /documents`, aucune pour une liste
+  vide — jamais une requête par ligne.
+
+Vérifié sur la stack : 22 tests d'intégration verts. Le compteur vaut `0` à
+l'import, `page_count` en `awaiting_validation`, et `0` sur un document dont le
+texte a été saisi à la main — c'est ce dernier cas qui prouve le filtre sur
+l'origine, invisible aux doubles des tests unitaires.
+
 ### Tests d'intégration : ce qu'ils couvrent (2026-09-12)
 
 `tests/integration/` parle à la vraie stack. 22 tests, ~4 minutes, Ollama requis.

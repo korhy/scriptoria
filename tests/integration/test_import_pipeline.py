@@ -55,6 +55,7 @@ def test_un_import_traverse_le_pipeline_jusqu_au_pretraitement() -> None:
     assert creation.status_code == 201, creation.text
     document = creation.json()
     assert document["page_count"] == 2
+    assert document["pages_transcribed"] == 0
     assert document["source_filename"] == "page1.png"
 
     # Le worker reprend la main : l'API n'a fait qu'enfiler.

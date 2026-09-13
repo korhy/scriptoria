@@ -143,7 +143,10 @@ def document_indexe(api: httpx.Client, ollama_pret: None, attendre) -> dict[str,
     attendre(document["id"], "preprocessed")
 
     assert api.post(f"/documents/{document['id']}/transcribe").status_code == 202
-    attendre(document["id"], "awaiting_validation", timeout=OCR_TIMEOUT)
+    transcrit = attendre(document["id"], "awaiting_validation", timeout=OCR_TIMEOUT)
+    # La progression doit être complète au moment où l'OCR rend la main : un
+    # compteur en retard ferait croire à un lot interrompu.
+    assert transcrit["pages_transcribed"] == transcrit["page_count"], transcrit
 
     page = premiere_page(api, document["id"])
     detail = api.get(f"/pages/{page['id']}").json()
@@ -212,7 +215,10 @@ def creer_document_indexe(api: httpx.Client, importer, attendre):
             json={"content_markdown": texte, "validate_now": True},
         )
         assert correction.status_code == 201, correction.text
-        attendre(document["id"], "indexed")
+        indexe = attendre(document["id"], "indexed")
+        # Texte saisi à la main : aucune révision OCR, donc aucune page transcrite.
+        # C'est ce qui prouve que le comptage filtre sur l'origine.
+        assert indexe["pages_transcribed"] == 0, indexe
         return {"document_id": document["id"], "page_id": page["id"]}
 
     return _creer
