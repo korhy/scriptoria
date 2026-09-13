@@ -23,6 +23,7 @@ from scriptoria.evaluation.rapport import (
     evaluer_transcriptions,
     rapport_markdown,
 )
+from scriptoria.evaluation.references import RELECTURE, SAISIE, Reference
 
 
 def corpus(references: dict[int, str] | None = None, **champs: object) -> Corpus:
@@ -42,8 +43,16 @@ def corpus(references: dict[int, str] | None = None, **champs: object) -> Corpus
 # --- Transcription ----------------------------------------------------------
 
 
+def saisies(textes: dict[int, str]) -> dict[int, Reference]:
+    return {page: Reference(texte, SAISIE) for page, texte in textes.items()}
+
+
+def relues(textes: dict[int, str]) -> dict[int, Reference]:
+    return {page: Reference(texte, RELECTURE) for page, texte in textes.items()}
+
+
 def test_sans_reference_le_taux_d_erreur_est_non_mesure() -> None:
-    resultat = evaluer_transcriptions(corpus(), {1: "texte", 2: "texte"})
+    resultat = evaluer_transcriptions({}, {1: "texte", 2: "texte"})
 
     assert resultat["cer_global"] is None
     assert resultat["pages"] == []
@@ -54,14 +63,14 @@ def test_le_taux_global_est_pondere_par_la_longueur_des_pages() -> None:
     references = {1: "abcd", 2: "abcdefghijklmnop"}
     textes = {1: "abcd", 2: "abcdefghXXXXXXXX"}
 
-    resultat = evaluer_transcriptions(corpus(references), textes)
+    resultat = evaluer_transcriptions(saisies(references), textes)
 
     assert resultat["cer_global"] == pytest.approx(8 / 20)
     assert [page["page"] for page in resultat["pages"]] == [1, 2]
 
 
 def test_une_page_de_reference_non_transcrite_est_listee_a_part() -> None:
-    resultat = evaluer_transcriptions(corpus({1: "abcd", 2: "efgh"}), {1: "abcd"})
+    resultat = evaluer_transcriptions(saisies({1: "abcd", 2: "efgh"}), {1: "abcd"})
 
     assert resultat["references_sans_transcription"] == [2]
     assert resultat["cer_global"] == 0.0
@@ -71,7 +80,7 @@ def test_les_nombres_sont_agreges_sur_les_pages_de_reference() -> None:
     references = {1: "lot 70/2.000", 2: "prix 2.250.000 et 32.700"}
     textes = {1: "lot 70/2.000", 2: "prix 2.250.000 et 32.100"}
 
-    resultat = evaluer_transcriptions(corpus(references), textes)
+    resultat = evaluer_transcriptions(saisies(references), textes)
 
     assert resultat["nombres"] == {
         "attendus": 3,
@@ -80,6 +89,24 @@ def test_les_nombres_sont_agreges_sur_les_pages_de_reference() -> None:
         "rappel": pytest.approx(2 / 3),
         "precision": pytest.approx(2 / 3),
     }
+
+
+def test_le_taux_est_aussi_donne_par_origine_de_la_reference() -> None:
+    """Une page relue part du texte de l'OCR : l'œil y laisse passer ce qu'une
+    saisie aurait vu. Les deux mesures ne se mélangent pas sans le dire."""
+    references = {**saisies({1: "abcd"}), **relues({2: "abcdefgh"})}
+    textes = {1: "abXd", 2: "abcdefgh"}
+
+    resultat = evaluer_transcriptions(references, textes)
+
+    assert resultat["cer_par_origine"] == {SAISIE: pytest.approx(0.25), RELECTURE: 0.0}
+    assert [page["origine"] for page in resultat["pages"]] == [SAISIE, RELECTURE]
+
+
+def test_une_origine_sans_page_est_non_mesuree() -> None:
+    resultat = evaluer_transcriptions(saisies({1: "abcd"}), {1: "abcd"})
+
+    assert resultat["cer_par_origine"][RELECTURE] is None
 
 
 # --- Rapport complet --------------------------------------------------------
@@ -110,6 +137,7 @@ def rapport_complet() -> dict:
         [question("q1", 1, "x"), question("q2", None, None)],
         configuration={"max_edge_px": 1600},
         durees={"ocr": 12.5},
+        references={},
     )
 
 
@@ -126,7 +154,9 @@ def test_le_rapport_agrege_controles_et_questions() -> None:
 
 
 def test_sans_question_la_recherche_est_non_mesuree() -> None:
-    rapport = construire_rapport(corpus(), {1: "texte"}, [], configuration={}, durees={})
+    rapport = construire_rapport(
+        corpus(), {1: "texte"}, [], configuration={}, durees={}, references={}
+    )
 
     assert rapport["recherche"] is None
 
@@ -138,3 +168,19 @@ def test_le_markdown_distingue_juste_faux_et_non_mesure() -> None:
     assert "✓" in texte
     assert "✗" in texte
     assert "q2" in texte
+
+
+def test_le_markdown_dit_qu_un_taux_sur_relectures_est_un_minimum() -> None:
+    rapport = construire_rapport(
+        corpus(),
+        {2: "texte relu"},
+        [],
+        configuration={},
+        durees={},
+        references=relues({2: "texte relu"}),
+    )
+
+    texte = rapport_markdown(rapport)
+
+    assert "relectures : 0.0% sur 1 page(s)" in texte
+    assert "minimum" in texte

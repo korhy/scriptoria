@@ -23,6 +23,7 @@ from scriptoria.evaluation.mesures import (
     taux_erreur_caracteres,
 )
 from scriptoria.evaluation.questions import rappel_a_k
+from scriptoria.evaluation.references import RELECTURE, SAISIE, Reference
 
 RANGS_RAPPORTES = (1, 3, 5, 10)
 NON_MESURE = "non mesuré"
@@ -49,34 +50,52 @@ def _score(score: ScoreNombres) -> dict[str, Any]:
     }
 
 
-def evaluer_transcriptions(corpus: Corpus, textes: Mapping[int, str]) -> dict[str, Any]:
+def _taux(erreurs: float, caracteres: int) -> float | None:
+    return erreurs / caracteres if caracteres else None
+
+
+def evaluer_transcriptions(
+    references: Mapping[int, Reference], textes: Mapping[int, str]
+) -> dict[str, Any]:
     """Taux d'erreur et exactitude des nombres, sur les pages dotées d'une référence.
 
     Le taux global est pondéré par la longueur : une page courte parfaite ne doit
-    pas masquer une page longue ratée.
+    pas masquer une page longue ratée. Il est aussi rendu par origine : une
+    référence relue part du texte de l'OCR, et le taux qu'elle donne est un minimum.
     """
     pages: list[dict[str, Any]] = []
     sans_transcription: list[int] = []
-    caracteres = 0
-    erreurs = 0.0
+    caracteres = dict.fromkeys((SAISIE, RELECTURE), 0)
+    erreurs = dict.fromkeys((SAISIE, RELECTURE), 0.0)
     total = ScoreNombres(0, 0, 0)
 
-    for numero, reference in sorted(corpus.references.items()):
+    for numero, reference in sorted(references.items()):
         if numero not in textes:
             sans_transcription.append(numero)
             continue
-        cer = taux_erreur_caracteres(reference, textes[numero])
-        longueur = len(normaliser_mise_en_page(reference))
-        score = exactitude_nombres(reference, textes[numero])
-        pages.append({"page": numero, "cer": cer, "caracteres": longueur, "nombres": _score(score)})
-        caracteres += longueur
-        erreurs += cer * longueur
+        cer = taux_erreur_caracteres(reference.texte, textes[numero])
+        longueur = len(normaliser_mise_en_page(reference.texte))
+        score = exactitude_nombres(reference.texte, textes[numero])
+        pages.append(
+            {
+                "page": numero,
+                "origine": reference.origine,
+                "cer": cer,
+                "caracteres": longueur,
+                "nombres": _score(score),
+            }
+        )
+        caracteres[reference.origine] += longueur
+        erreurs[reference.origine] += cer * longueur
         total = ScoreNombres(
             total.attendus + score.attendus, total.lus + score.lus, total.justes + score.justes
         )
 
     return {
-        "cer_global": erreurs / caracteres if caracteres else None,
+        "cer_global": _taux(sum(erreurs.values()), sum(caracteres.values())),
+        "cer_par_origine": {
+            origine: _taux(erreurs[origine], caracteres[origine]) for origine in (SAISIE, RELECTURE)
+        },
         "pages": pages,
         "references_sans_transcription": sans_transcription,
         "nombres": _score(total),
@@ -125,6 +144,8 @@ def construire_rapport(
     questions: Sequence[ResultatQuestion],
     configuration: Mapping[str, Any],
     durees: Mapping[str, float],
+    *,
+    references: Mapping[int, Reference],
 ) -> dict[str, Any]:
     return {
         "corpus": corpus.nom,
@@ -132,7 +153,7 @@ def construire_rapport(
         "pages_non_transcrites": [n for n in range(1, len(corpus.pages) + 1) if n not in textes],
         "configuration": dict(configuration),
         "durees_secondes": dict(durees),
-        "transcription": evaluer_transcriptions(corpus, textes),
+        "transcription": evaluer_transcriptions(references, textes),
         "controles": evaluer_controles(corpus, textes),
         "recherche": evaluer_recherche(questions),
     }
@@ -150,13 +171,21 @@ def _section_transcription(transcription: Mapping[str, Any]) -> list[str]:
     lignes = ["## Transcription", ""]
     if transcription["cer_global"] is None:
         lignes.append(
-            f"- Taux d'erreur par caractère : {NON_MESURE} (aucun texte de référence saisi)"
+            f"- Taux d'erreur par caractère : {NON_MESURE} (ni page saisie, ni relecture validée)"
         )
     else:
         lignes.append(
             f"- Taux d'erreur par caractère : {_pourcentage(transcription['cer_global'])} "
             f"sur {len(transcription['pages'])} page(s) de référence"
         )
+        for origine, libelle, remarque in (
+            (SAISIE, "saisies", ""),
+            (RELECTURE, "relectures", " — un minimum : la relecture part du texte de l'OCR"),
+        ):
+            nombre = sum(1 for page in transcription["pages"] if page["origine"] == origine)
+            if nombre:
+                taux = _pourcentage(transcription["cer_par_origine"][origine])
+                lignes.append(f"  - {libelle} : {taux} sur {nombre} page(s){remarque}")
     nombres = transcription["nombres"]
     lignes.append(
         f"- Nombres : {nombres['justes']} justes sur {nombres['attendus']} attendus "
@@ -168,9 +197,9 @@ def _section_transcription(transcription: Mapping[str, Any]) -> list[str]:
             f"- Références sans transcription : {transcription['references_sans_transcription']}"
         )
     if transcription["pages"]:
-        lignes += ["", "| Page | Taux d'erreur | Nombres justes |", "|---|---|---|"]
+        lignes += ["", "| Page | Origine | Taux d'erreur | Nombres justes |", "|---|---|---|---|"]
         lignes += [
-            f"| {p['page']} | {_pourcentage(p['cer'])} | "
+            f"| {p['page']} | {p['origine']} | {_pourcentage(p['cer'])} | "
             f"{p['nombres']['justes']}/{p['nombres']['attendus']} |"
             for p in transcription["pages"]
         ]

@@ -444,6 +444,15 @@ resultats/              rapports datés, JSON + Markdown
   les recherches, puis toutes les réponses.
 - **Reprise** : `make eval CORPUS=… DOCUMENT=<id>` réutilise un document déjà
   importé, et ne relance l'OCR que s'il n'est pas transcrit.
+- **Une relecture validée dans l'UI sert de référence** (2026-09-13) : relire
+  suffit à faire avancer la mesure, sans double saisie. Mais elle part du texte de
+  l'OCR, et l'œil y laisse passer ce que le modèle a bien imité : le taux qu'elle
+  donne est un **minimum**. D'où trois règles (`evaluation/references.py`) : un
+  fichier `reference/page-NN.md` **prime** sur la relecture de la même page ; un
+  brouillon non validé n'est pas une référence ; le rapport donne le taux **par
+  origine** (`saisie`, `relecture`) en plus du taux global. Mesure indicative sur
+  les 5 premières pages relues : 0,4 %, 35 nombres justes sur 36 — le seul faux
+  est une date plausible (`1956` pour `1953`) sur la page de garde.
 
 Premier corpus : `reglement-valmy-1953`, règlement de copropriété notarié de 1953,
 44 pages dactylographiées (JPEG 1239×1615 à 150 ppi, qualité 62, pages 1-2 très

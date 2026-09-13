@@ -37,6 +37,12 @@ from scriptoria.config import Settings, get_settings
 from scriptoria.evaluation.corpus import Corpus, CorpusError, charger_corpus
 from scriptoria.evaluation.questions import rang_premiere_page, reponse_contient
 from scriptoria.evaluation.rapport import ResultatQuestion, construire_rapport, rapport_markdown
+from scriptoria.evaluation.references import (
+    RELECTURE,
+    SAISIE,
+    derniere_revision,
+    fusionner_references,
+)
 from scriptoria.services.chunking import chunk_markdown
 from scriptoria.services.embeddings import embed_texts
 from scriptoria.services.generation import context_budget, generate_answer
@@ -130,18 +136,24 @@ def transcrire(api: httpx.Client, document_id: str, settings: Settings) -> None:
     attendre(api, document_id, STATUTS_TRANSCRITS, transcription_timeout_seconds(settings))
 
 
-def lire_transcriptions(api: httpx.Client, document_id: str) -> dict[int, str]:
-    """Dernière révision d'origine `ocr` de chaque page — la sortie du modèle, pas du relecteur."""
+def lire_revisions(api: httpx.Client, document_id: str) -> tuple[dict[int, str], dict[int, str]]:
+    """Par page : la dernière sortie de l'OCR, et la dernière relecture validée.
+
+    La première est ce qu'on mesure. La seconde sert de référence là où aucune page
+    n'a été saisie en fichier : relire dans l'UI suffit à faire avancer la mesure.
+    """
     pages = _verifier(api.get(f"/documents/{document_id}/pages"), 200, "lecture des pages")
-    textes: dict[int, str] = {}
+    ocr: dict[int, str] = {}
+    relectures: dict[int, str] = {}
     for page in pages:
-        detail = _verifier(
-            api.get(f"/pages/{page['id']}"), 200, f"lecture de la page {page['page_number']}"
-        )
-        ocr = [t for t in detail["transcriptions"] if t["origin"] == "ocr"]
-        if ocr:
-            textes[page["page_number"]] = ocr[-1]["content_markdown"]
-    return textes
+        numero = page["page_number"]
+        detail = _verifier(api.get(f"/pages/{page['id']}"), 200, f"lecture de la page {numero}")
+        revisions = detail["transcriptions"]
+        if (texte := derniere_revision(revisions, origine="ocr")) is not None:
+            ocr[numero] = texte
+        if (texte := derniere_revision(revisions, origine="human", validee=True)) is not None:
+            relectures[numero] = texte
+    return ocr, relectures
 
 
 # --- Recherche : index d'évaluation séparé ----------------------------------
@@ -276,7 +288,7 @@ def evaluer(argument: str, document_id: str | None, avec_reponses: bool) -> tupl
     corpus = charger_corpus(resoudre_corpus(argument, settings))
     print(
         f"Corpus « {corpus.nom} » : {len(corpus.pages)} pages, "
-        f"{len(corpus.references)} référence(s), "
+        f"{len(corpus.references)} référence(s) saisie(s), "
         f"{len(corpus.controles_tables) + len(corpus.controles_nombres)} contrôle(s), "
         f"{len(corpus.questions)} question(s)"
     )
@@ -289,14 +301,24 @@ def evaluer(argument: str, document_id: str | None, avec_reponses: bool) -> tupl
             document_id = importer(api, corpus)
         transcrire(api, document_id, settings)
         durees["import_et_ocr"] = time.monotonic() - debut
-        textes = lire_transcriptions(api, document_id)
+        textes, relectures = lire_revisions(api, document_id)
+
+    references = fusionner_references(corpus.references, relectures)
+    saisies = sum(1 for reference in references.values() if reference.origine == SAISIE)
+    relues = sum(1 for reference in references.values() if reference.origine == RELECTURE)
+    print(f"→ références : {saisies} saisie(s), {relues} relue(s) et validée(s) dans l'UI")
 
     debut = time.monotonic()
     questions, _ = asyncio.run(interroger(corpus, settings, document_id, textes, avec_reponses))
     durees["recherche"] = time.monotonic() - debut
 
     rapport = construire_rapport(
-        corpus, textes, questions, configuration(settings, corpus, document_id, horodatage), durees
+        corpus,
+        textes,
+        questions,
+        configuration(settings, corpus, document_id, horodatage),
+        durees,
+        references=references,
     )
     markdown = rapport_markdown(rapport)
     resultats = corpus.dossier / "resultats"
