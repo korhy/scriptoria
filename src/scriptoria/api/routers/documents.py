@@ -11,12 +11,16 @@ from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
 import anyio
+from arq.connections import ArqRedis
+from arq.jobs import Job as ArqJob
+from arq.jobs import JobStatus as ArqJobStatus
+from elasticsearch import ApiError, TransportError
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy import distinct, func, select
+from sqlalchemy import delete, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scriptoria.api.deps import AppSettings, DbSession, TaskQueue
+from scriptoria.api.deps import AppSettings, DbSession, EsClient, TaskQueue
 from scriptoria.db.models import Document, Job, Page, Transcription
 from scriptoria.domain.enums import DocumentStatus, JobStatus, TranscriptionOrigin
 from scriptoria.schemas.document import DocumentRead, JobAccepted
@@ -37,6 +41,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+# États arq d'un job qui peut encore écrire sur un document.
+_ARQ_ACTIVE_STATUSES = frozenset(
+    {ArqJobStatus.queued, ArqJobStatus.deferred, ArqJobStatus.in_progress}
+)
 
 
 async def _pages_transcribed(session: AsyncSession, document_ids: list[UUID]) -> dict[UUID, int]:
@@ -86,6 +95,19 @@ def _relaunch_refusal(last_job: Job | None) -> str | None:
     return None
 
 
+async def _arq_job_active(queue: ArqRedis, arq_job_id: str | None) -> bool:
+    """arq tient-il encore ce job en file ou en cours ?
+
+    La base ne suffit pas : un job peut y rester `running` longtemps après la mort
+    de sa tâche — c'est ce que laissait le défaut d'annulation corrigé le
+    2026-09-13. arq, lui, sait ce qui tourne. Sans identifiant, rien ne prouve que
+    le job est mort : il est présumé actif.
+    """
+    if arq_job_id is None:
+        return True
+    return await ArqJob(arq_job_id, queue).status() in _ARQ_ACTIVE_STATUSES
+
+
 def _to_read(document: Document, pages_transcribed: int) -> DocumentRead:
     return DocumentRead(
         id=document.id,
@@ -117,6 +139,74 @@ async def get_document(document_id: UUID, session: DbSession) -> DocumentRead:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document introuvable")
     counts = await _pages_transcribed(session, [document_id])
     return _to_read(document, counts.get(document_id, 0))
+
+
+@router.delete(
+    "/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Supprime un document : index, base et fichiers",
+)
+async def delete_document(
+    document_id: UUID,
+    session: DbSession,
+    es: EsClient,
+    queue: TaskQueue,
+    settings: AppSettings,
+) -> None:
+    """Retire un document de partout, dans un ordre qui ne ment jamais.
+
+    1. **L'index d'abord.** Si la suite échoue, le document reste en base sans
+       fragment et `make reindex` le rétablit. Dans l'ordre inverse, une panne
+       d'Elasticsearch laisserait la recherche citer un document disparu.
+    2. **La base ensuite**, validée ici même : la cascade des clés étrangères
+       emporte pages, révisions, blocs de confiance et jobs.
+    3. **Les fichiers en dernier**, une fois la base validée : un commit raté
+       laisserait sinon un document privé de ses images.
+
+    Refusé tant qu'arq tient un job du document en file ou en cours : supprimer
+    sous un worker qui écrit ferait échouer sa tâche au milieu d'une page.
+    """
+    document = await session.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "document introuvable")
+
+    result = await session.execute(
+        select(Job).where(
+            Job.document_id == document_id,
+            Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+        )
+    )
+    for job in result.scalars().all():
+        if await _arq_job_active(queue, job.arq_job_id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"un job '{job.kind}' est encore '{job.status.value}' pour ce document : "
+                "attendre sa fin avant de le supprimer.",
+            )
+
+    try:
+        await es.delete_by_query(
+            index=settings.elasticsearch_index,
+            query={"term": {"document_id": str(document_id)}},
+            # Index absent : il n'y a rien à retirer, ce n'est pas une panne.
+            ignore_unavailable=True,
+            # Une recherche lancée juste après ne doit plus trouver le document.
+            refresh=True,
+            conflicts="proceed",
+        )
+    except (ApiError, TransportError) as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Elasticsearch n'a pas retiré les fragments du document ({exc}) : "
+            "rien n'a été supprimé.",
+        ) from exc
+
+    await session.execute(delete(Document).where(Document.id == document_id))
+    await session.commit()
+
+    # Suppression disque bloquante : déportée dans un thread.
+    await anyio.to_thread.run_sync(remove_document_files, settings.data_dir, document_id)
+    logger.info("document %s supprimé : index, base et fichiers", document_id)
 
 
 @router.get("/{document_id}/pages", response_model=list[PageRead], summary="Pages d'un document")

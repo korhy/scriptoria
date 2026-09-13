@@ -15,6 +15,7 @@ ROUTES_ATTENDUES = [
     ("/documents", "post"),
     ("/documents", "get"),
     ("/documents/{document_id}", "get"),
+    ("/documents/{document_id}", "delete"),
     ("/documents/{document_id}/pages", "get"),
     ("/documents/{document_id}/pages/{page_number}/image", "get"),
     ("/documents/{document_id}/transcribe", "post"),

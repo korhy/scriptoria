@@ -328,9 +328,34 @@ n'exécute aucun `except`. arq devrait relancer le job à l'expiration de sa
 réservation, mais cela reste à éprouver. Un document bloqué **avant** ce correctif
 reste `transcribing` : le correctif ne le débloque pas.
 
+### Suppression : `DELETE /documents/{id}` (2026-09-13)
+
+Retire un document de l'index, de la base et du disque, **dans cet ordre** :
+
+1. **Index d'abord** (`delete_by_query` sur `document_id`, `refresh=True`). Si la
+   suite échoue, le document reste en base sans fragment et `make reindex` le
+   rétablit. Dans l'ordre inverse, une panne d'ES laisserait la recherche citer un
+   document disparu. ES en panne ⇒ 503 et **rien** n'est supprimé ; index absent ⇒
+   rien à retirer, pas une panne.
+2. **Base ensuite**, par un `DELETE` SQL validé dans la route : les clés étrangères
+   `ON DELETE CASCADE` emportent pages, révisions, blocs et jobs. La cascade ORM
+   est évitée — elle chargerait les enfants paresseusement, ce qui échoue en async.
+3. **Fichiers en dernier**, une fois le commit passé : un commit raté laisserait
+   sinon un document privé de ses images.
+
+**409 tant qu'arq tient un job du document en file ou en cours.** La base ne
+suffit pas à le dire : un job peut y rester `running` après la mort de sa tâche
+(défaut d'annulation ci-dessus). C'est arq (`Job.status()`) qui tranche ; sans
+identifiant arq, le job est présumé actif.
+
+Vérifié sur la stack : lignes et fichiers présents avant, plus rien après, fragment
+retiré ; un job `running` inconnu d'arq ne bloque pas (vrai Redis) ; seconde
+suppression ⇒ 404. `remove_document_files` ignore les erreurs disque : un dossier
+qui résisterait resterait orphelin sans le signaler.
+
 ### Tests d'intégration : ce qu'ils couvrent (2026-09-12)
 
-`tests/integration/` parle à la vraie stack. 22 tests, ~4 minutes, Ollama requis.
+`tests/integration/` parle à la vraie stack. 25 tests, ~4 minutes, Ollama requis.
 Ils existent parce que les tests unitaires remplacent Postgres, Elasticsearch et
 les modèles par des doubles : un champ mal nommé dans une requête ES, une
 dimension de vecteur désalignée ou une écriture qui duplique au lieu d'écraser
@@ -343,6 +368,7 @@ ne se voient que là.
 | `test_ocr_ollama.py` | la requête vision est bien celle qu'Ollama attend |
 | `test_validation_indexing.py` | révision `n+1` sans écrasement, fragment indexé (1024 dim), correction qui **remplace** le fragment, `reindex` idempotent |
 | `test_search_pipeline.py` | recherche hybride, réponse avec sources, **fausse consigne citée sans être exécutée** |
+| `test_document_deletion.py` | suppression complète (base par cascade, fragments ES, dossiers), job mort dans arq non bloquant |
 
 Deux règles apprises en les écrivant, à respecter pour en ajouter :
 
