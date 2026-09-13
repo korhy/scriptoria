@@ -416,6 +416,75 @@ comme les renvois), suppression confirmée.
 construction. Toute modification de la configuration de couverture ou de ruff
 demande `docker compose up -d --build api` pour prendre effet dans `make test`.
 
+### Harnais d'évaluation (2026-09-13)
+
+`make eval CORPUS=<nom>` mesure l'OCR et la recherche sur un corpus réel, rangé
+**hors Git** sous `data/corpus/<nom>/` (actes réels : noms, adresses) :
+
+```
+pages/page-NN.jpg       une image par page, numérotées sans trou
+reference/page-NN.md    texte de référence saisi à la main (conventions : reference/LISEZMOI.md)
+controles.toml          contrôles objectifs, sans référence
+questions.toml          questions, pages sources, valeurs acceptées
+resultats/              rapports datés, JSON + Markdown
+```
+
+- **Mesures** (`src/scriptoria/evaluation/`, fonctions pures, testées) : taux
+  d'erreur par caractère **pondéré par la longueur**, exactitude des **nombres**
+  (le `I` tapé pour un `1` vaut `1`), tables de tantièmes reconstituées sur
+  plusieurs pages et tranchées sur leur ligne de total, rappel@k et réponses
+  contenant une valeur acceptée.
+- **« Non mesuré » n'est jamais « juste »** : sans référence le taux d'erreur est
+  absent, pas nul ; une page non transcrite rend un contrôle invérifiable, pas faux.
+- **La recherche s'évalue sur un index séparé** (`<index>-eval-<corpus>`), bâti
+  depuis les révisions `ocr` en base. L'index principal n'accepte que des
+  révisions validées par un humain : les faire valider par un script trahirait
+  ce principe.
+- **Un seul échange de modèle** : toutes les questions vectorisées, puis toutes
+  les recherches, puis toutes les réponses.
+- **Reprise** : `make eval CORPUS=… DOCUMENT=<id>` réutilise un document déjà
+  importé, et ne relance l'OCR que s'il n'est pas transcrit.
+
+Premier corpus : `reglement-valmy-1953`, règlement de copropriété notarié de 1953,
+44 pages dactylographiées (JPEG 1239×1615 à 150 ppi, qualité 62, pages 1-2 très
+sombres, frappe carbone, annotations manuscrites, passage barré). Ses tables de
+tantièmes se somment à 2 000 et 2 × 1 000 : toute erreur de lecture d'un chiffre
+casse un total.
+
+**Premier passage mesuré (2026-09-13)**, sans texte de référence :
+
+| Mesure | Résultat |
+|---|---|
+| Tantièmes généraux (59 lots, p. 26-29) | ✓ 59/59, somme 2000 |
+| Tantièmes spéciaux Valmy / Coubertin (p. 30-33) | ✓ 26/26 et 33/33, sommes 1000 |
+| Nombres p. 42 (polices) | ✓ 2/2 |
+| Nombres p. 6 (prix de 1948) | ✗ `505.885` **omis**, `2.250.000` lu `2,250.000` |
+| Rappel @1 / @3 / @5 / @10 | 61,5 % / 69,2 % / 92,3 % / 92,3 % |
+| Réponses contenant la valeur attendue | 6/13 |
+
+- **L'OCR a supprimé un montant sans laisser de trace** : en page 6, la ligne
+  « … de surplus, ci 505.885 » perd son chiffre, et « deux cent *dix* sept
+  mille » perd un mot. Le montant chiffré `2.217.300`, lui, est juste. C'est la
+  corruption silencieuse redoutée, cette fois sur un vrai document, et seul un
+  contrôle de nombres attendus l'a vue.
+- **Les 6 réponses fausses dont la page arrive en tête ne viennent pas de l'OCR** :
+  la valeur attendue figure dans le texte transcrit de chacune (notaire, date de
+  l'acte, assureur, heure de fermeture, occupants de deux lots).
+- **Cause : Ollama tronque le prompt de génération.** `num_ctx` n'est pas fixé,
+  Ollama applique 4 096 ; cinq pages font ~11 000 caractères, soit ~4 100 jetons.
+  Log : `truncating input prompt limit=2051 prompt=4120`. Ollama garde **la fin**
+  du prompt : `SYSTEM_RULES` (dont la consigne anti-injection) et les premiers
+  passages disparaissent. Les réponses justes aux rangs 4-5 et fausses au rang 1
+  en sont la signature. Le test d'intégration d'injection ne le voit pas : sa page
+  unique est courte. **Défaut de `/search/answer`, pas du harnais — à corriger
+  avant tout autre réglage de la recherche.**
+- **Tantièmes du lot 37 : échec de recherche**, la page 28 hors des 10 premiers
+  alors que l'OCR y lit bien `44/2.000`. Quatre pages de tables quasi identiques
+  en un fragment chacune : premier indice contre le découpage par page.
+- **Durées faussées** : pages 2 à 22 à 150-270 s au lieu de ~55 s, avec 32 Go de
+  swap pleins (`fseventsd` à 16 Go, Kibana et d'autres projets démarrés). Le
+  coût d'un lot se mesure machine déchargée.
+
 ### Tests d'intégration : ce qu'ils couvrent (2026-09-12)
 
 `tests/integration/` parle à la vraie stack. 25 tests, ~4 minutes, Ollama requis.

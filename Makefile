@@ -74,6 +74,10 @@ psql: ## Console Postgres
 reindex: ## Reconstruit l'index Elasticsearch depuis Postgres (ES est jetable)
 	$(COMPOSE) exec api python -m scriptoria.scripts.reindex
 
+eval: ## Évalue OCR et recherche sur un corpus réel (CORPUS=nom, DOCUMENT=id pour reprendre)
+	$(if $(CORPUS),,$(error CORPUS=<nom> requis, ex. make eval CORPUS=reglement-valmy-1953))
+	$(COMPOSE) exec api python -m scriptoria.scripts.evaluate $(CORPUS) $(if $(DOCUMENT),--document $(DOCUMENT))
+
 smoke: ## Vérifications de bout en bout (infra + Ollama + vision)
 	@bash scripts/smoke.sh
 
