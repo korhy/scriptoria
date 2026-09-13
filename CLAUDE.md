@@ -123,7 +123,7 @@ POST /search/answer → passages → mistral local → réponse + sources citée
 
 **Le pipeline est complet de l'import à la réponse générée.** Plus aucune route ne renvoie 501 — `tests/unit/test_api_surface.py::test_plus_aucune_route_ne_se_declare_a_ecrire` en est le garde-fou.
 
-**Reste à faire** : harnais d'évaluation (mesurer la qualité de recherche sur un jeu de questions), traitement par lots réels (200 pages), et les deux points de granularité encore ouverts ci-dessous. Les modules correspondants de `services/` sont des stubs typés qui figent les frontières ; les routes renvoient 501.
+**Reste à faire** : harnais d'évaluation (mesurer la qualité de recherche sur un jeu de questions), traitement par lots réels (200 pages), et les deux points de granularité encore ouverts ci-dessous.
 
 Deux conventions à respecter en poursuivant :
 
@@ -297,6 +297,36 @@ Vérifié sur la stack : 22 tests d'intégration verts. Le compteur vaut `0` à
 l'import, `page_count` en `awaiting_validation`, et `0` sur un document dont le
 texte a été saisi à la main — c'est ce dernier cas qui prouve le filtre sur
 l'origine, invisible aux doubles des tests unitaires.
+
+### Interruption d'une tâche et relance : corrigé le 2026-09-13
+
+**Défaut reproduit sur la stack** : arq coupe une tâche qui dépasse son délai en
+l'**annulant** (`asyncio.CancelledError`), et cette exception n'hérite pas
+d'`Exception`. Les trois tâches n'interceptaient que `Exception` : un OCR coupé
+laissait le document `transcribing` et son job `RUNNING` pour toujours, et
+`POST /transcribe` refusait la relance (409). Or le délai commun (`job_timeout =
+3600`) coupait tout lot de plus de ~60 pages.
+
+- **`_mark_failed` traite erreur et annulation** dans les trois tâches, puis
+  relance : sans cela arq ne peut pas conclure l'arrêt. Message du job :
+  `interrompu : délai dépassé ou arrêt du worker`.
+- **L'OCR a son propre délai** : `MAX_PAGES_PER_DOCUMENT × 2 ×
+  ollama_timeout_seconds` (double passage au pire cas). Une page bloquée est déjà
+  coupée par le délai HTTP ; ce délai-ci n'est qu'un filet. Prétraitement et
+  indexation gardent une heure.
+- **`POST /transcribe` accepte un document `failed`** si son dernier job est un
+  OCR en échec. Refusé après un prétraitement raté (on transcrirait des images
+  non nettoyées), après une indexation ratée, ou si une relance est déjà en file.
+  Le worker saute les pages faites ; `pages_transcribed` dit où il reprend.
+
+Vérifié sur la stack avec un worker dont l'OCR est coupé à 5 s : document
+`failed`, relance 202, seconde relance 409, puis le vrai worker mène le document
+à `awaiting_validation`. arq passe de « 1 ongoing to cancel » à « 0 ».
+
+**Non vérifié** : un worker tué brutalement (manque de mémoire, `SIGKILL`)
+n'exécute aucun `except`. arq devrait relancer le job à l'expiration de sa
+réservation, mais cela reste à éprouver. Un document bloqué **avant** ce correctif
+reste `transcribing` : le correctif ne le débloque pas.
 
 ### Tests d'intégration : ce qu'ils couvrent (2026-09-12)
 

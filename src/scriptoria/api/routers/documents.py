@@ -60,6 +60,32 @@ async def _pages_transcribed(session: AsyncSession, document_ids: list[UUID]) ->
     return {document_id: count for document_id, count in result.all()}
 
 
+async def _last_job(session: AsyncSession, document_id: UUID) -> Job | None:
+    """Le job le plus récent du document, quel qu'en soit le type."""
+    result = await session.execute(
+        select(Job).where(Job.document_id == document_id).order_by(Job.created_at.desc()).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+def _relaunch_refusal(last_job: Job | None) -> str | None:
+    """Pourquoi un document en échec ne peut pas repartir en OCR — `None` s'il le peut.
+
+    Seul un OCR en échec se relance : après un prétraitement raté, l'OCR
+    transcrirait des images non nettoyées ; après une indexation ratée, c'est
+    l'indexation qu'il faut rejouer. Et une relance déjà en file ne se double pas.
+    """
+    if last_job is None:
+        return "document en échec sans job enregistré : impossible de dire quelle étape relancer."
+    if last_job.kind != "transcribe":
+        return (
+            f"l'échec vient de l'étape '{last_job.kind}' : seul un OCR en échec peut être relancé."
+        )
+    if last_job.status != JobStatus.FAILED:
+        return f"un OCR est déjà '{last_job.status.value}' pour ce document."
+    return None
+
+
 def _to_read(document: Document, pages_transcribed: int) -> DocumentRead:
     return DocumentRead(
         id=document.id,
@@ -246,15 +272,24 @@ async def transcribe_document(
 ) -> JobAccepted:
     """Met l'OCR en file. Ne transcrit rien : une page coûte de l'ordre de la minute.
 
-    Exige un document `preprocessed`. OCRiser une image non nettoyée dépenserait
-    des heures pour un résultat dégradé, et relancer un document déjà en cours
-    ferait tourner deux modèles vision à la fois sur une machine de 16 Go.
+    Exige un document `preprocessed`, ou `failed` au cours d'un OCR. OCRiser une
+    image non nettoyée dépenserait des heures pour un résultat dégradé, et relancer
+    un document déjà en cours ferait tourner deux modèles vision à la fois sur une
+    machine de 16 Go.
+
+    **Relance après échec** : le worker saute les pages qui portent déjà une
+    révision OCR. Un lot interrompu à la 180ᵉ page reprend à la 181ᵉ —
+    `pages_transcribed` dit où.
     """
     document = await session.get(Document, document_id)
     if document is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document introuvable")
 
-    if document.status != DocumentStatus.PREPROCESSED:
+    if document.status == DocumentStatus.FAILED:
+        refusal = _relaunch_refusal(await _last_job(session, document_id))
+        if refusal is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, refusal)
+    elif document.status != DocumentStatus.PREPROCESSED:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             f"document en statut '{document.status.value}' : l'OCR attend un document "

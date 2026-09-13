@@ -9,6 +9,7 @@ déjà traité réécrit les mêmes fichiers aux mêmes chemins. C'est ce qui re
 reprise après incident possible sans nettoyage préalable.
 """
 
+import asyncio
 import logging
 from itertools import batched
 from pathlib import Path
@@ -50,6 +51,9 @@ logger = logging.getLogger(__name__)
 # Un lot de 16 fragments reste confortable et amortit les allers-retours HTTP.
 EMBEDDING_BATCH_SIZE = 16
 
+# Ce qu'on inscrit quand arq annule une tâche : une annulation n'a pas de message.
+INTERRUPTED_ERROR = "interrompu : délai dépassé ou arrêt du worker"
+
 
 async def _update_job(
     session: AsyncSession,
@@ -71,6 +75,27 @@ async def _update_job(
     job.status = status
     if error is not None:
         job.error = error
+
+
+async def _mark_failed(
+    factory: async_sessionmaker[AsyncSession], doc_id: UUID, kind: str, exc: BaseException
+) -> None:
+    """Marque le document et son dernier job de ce type en échec.
+
+    Vaut pour une erreur comme pour une **annulation** : arq annule une tâche qui
+    dépasse son délai ou que l'arrêt du worker interrompt. `CancelledError`
+    n'hérite pas d'`Exception` ; ne l'intercepter nulle part laissait le document
+    « en cours » et son job `running` pour toujours (reproduit le 2026-09-13).
+
+    Session neuve : celle de la transaction interrompue n'est plus utilisable.
+    """
+    error = INTERRUPTED_ERROR if isinstance(exc, asyncio.CancelledError) else str(exc)
+    async with factory() as session:
+        document = await session.get(Document, doc_id)
+        if document is not None:
+            document.status = DocumentStatus.FAILED
+        await _update_job(session, doc_id, kind, JobStatus.FAILED, error=error)
+        await session.commit()
 
 
 async def preprocess_document(ctx: dict[str, Any], document_id: str) -> None:
@@ -131,16 +156,11 @@ async def preprocess_document(ctx: dict[str, Any], document_id: str) -> None:
 
         logger.info("document %s prétraité (%s pages)", doc_id, page_count)
 
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         logger.exception("prétraitement du document %s en échec", doc_id)
-        # Session neuve : celle de la transaction annulée n'est plus utilisable.
-        async with factory() as session:
-            document = await session.get(Document, doc_id)
-            if document is not None:
-                document.status = DocumentStatus.FAILED
-            await _update_job(session, doc_id, "preprocess", JobStatus.FAILED, error=str(exc))
-            await session.commit()
-        # Relancée pour qu'arq enregistre l'échec au lieu de le croire réussi.
+        await _mark_failed(factory, doc_id, "preprocess", exc)
+        # Relancée pour qu'arq enregistre l'échec au lieu de le croire réussi — et,
+        # pour une annulation, pour qu'il puisse conclure l'arrêt de la tâche.
         raise
 
 
@@ -293,17 +313,11 @@ async def transcribe_document(ctx: dict[str, Any], document_id: str) -> None:
             "document %s transcrit (%s pages, %s déjà faites)", doc_id, transcribed, skipped
         )
 
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         logger.exception("transcription du document %s en échec", doc_id)
-        # Session neuve : celle de la transaction annulée n'est plus utilisable.
-        # Les pages déjà transcrites, elles, sont validées et seront sautées au
-        # prochain passage.
-        async with factory() as session:
-            document = await session.get(Document, doc_id)
-            if document is not None:
-                document.status = DocumentStatus.FAILED
-            await _update_job(session, doc_id, "transcribe", JobStatus.FAILED, error=str(exc))
-            await session.commit()
+        # Les pages déjà transcrites sont validées en base : une relance depuis
+        # l'API (`failed` → `POST /transcribe`) les sautera.
+        await _mark_failed(factory, doc_id, "transcribe", exc)
         raise
 
 
@@ -401,12 +415,7 @@ async def index_document(ctx: dict[str, Any], document_id: str) -> int:
         logger.info("document %s indexé (%s fragment(s))", doc_id, written)
         return written
 
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         logger.exception("indexation du document %s en échec", doc_id)
-        async with factory() as session:
-            document = await session.get(Document, doc_id)
-            if document is not None:
-                document.status = DocumentStatus.FAILED
-            await _update_job(session, doc_id, "index", JobStatus.FAILED, error=str(exc))
-            await session.commit()
+        await _mark_failed(factory, doc_id, "index", exc)
         raise

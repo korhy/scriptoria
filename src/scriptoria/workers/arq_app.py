@@ -10,13 +10,26 @@ from typing import Any, ClassVar
 
 import httpx
 from arq.connections import RedisSettings
+from arq.worker import Function, func
 from elasticsearch import AsyncElasticsearch
 
-from scriptoria.config import get_settings
+from scriptoria.config import Settings, get_settings
 from scriptoria.db.session import create_engine, create_sessionmaker
+from scriptoria.services.storage import MAX_PAGES_PER_DOCUMENT
 from scriptoria.workers.tasks import index_document, preprocess_document, transcribe_document
 
 logger = logging.getLogger(__name__)
+
+
+def transcription_timeout_seconds(settings: Settings) -> float:
+    """Délai au-delà duquel arq annule l'OCR d'un document.
+
+    Au pire cas, chaque page consomme deux délais Ollama complets (double
+    passage). Une page bloquée est déjà coupée par le délai HTTP : ce délai-ci
+    n'est qu'un filet, qui ne doit jamais interrompre un lot qui avance. Le délai
+    commun d'une heure coupait tout lot de plus de ~60 pages.
+    """
+    return MAX_PAGES_PER_DOCUMENT * 2 * settings.ollama_timeout_seconds
 
 
 async def startup(ctx: dict[str, Any]) -> None:
@@ -57,9 +70,9 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    functions: ClassVar[list[Callable[..., Any]]] = [
+    functions: ClassVar[list[Callable[..., Any] | Function]] = [
         preprocess_document,
-        transcribe_document,
+        func(transcribe_document, timeout=transcription_timeout_seconds(get_settings())),
         index_document,
     ]
     on_startup = startup
@@ -68,4 +81,6 @@ class WorkerSettings:
     # Une seule tâche à la fois : sur 16 Go unifiés, deux OCR vision en parallèle
     # feraient déborder la mémoire et s'échanger le modèle en boucle.
     max_jobs = 1
+    # Délai commun : prétraiter ou indexer 200 pages tient en minutes. L'OCR, qui
+    # se compte en heures, a le sien (`transcription_timeout_seconds`).
     job_timeout = 3600

@@ -9,6 +9,7 @@ Deux propriétés comptent ici :
    une page sans révision validée, la tâche échoue en la nommant.
 """
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -255,6 +256,25 @@ async def test_un_echec_de_vectorisation_marque_le_document(
 
     assert contexte["document"].status is DocumentStatus.FAILED
     assert contexte["session"].job.status is JobStatus.FAILED
+
+
+async def test_une_annulation_pendant_l_indexation_marque_le_document_en_echec(
+    contexte: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un délai dépassé ou un arrêt du worker annule la tâche sans lever d'Exception."""
+
+    async def vectorisation_interminable(*args: Any, **kwargs: Any) -> list[list[float]]:
+        await asyncio.sleep(3600)
+        raise AssertionError("inatteignable")
+
+    monkeypatch.setattr("scriptoria.workers.tasks.embed_texts", vectorisation_interminable)
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(index_document(contexte, str(contexte["document"].id)), 0.05)
+
+    assert contexte["document"].status is DocumentStatus.FAILED
+    assert contexte["session"].job.status is JobStatus.FAILED
+    assert "interrompu" in (contexte["session"].job.error or "")
 
 
 async def test_un_document_absent_n_est_pas_une_erreur(

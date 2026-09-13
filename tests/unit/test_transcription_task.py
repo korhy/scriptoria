@@ -9,6 +9,7 @@ La base et Ollama sont simulés : ces tests décrivent l'enchaînement, pas
 SQLAlchemy. Le branchement réel est couvert par les tests d'intégration.
 """
 
+import asyncio
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -258,6 +259,32 @@ async def test_un_echec_marque_le_document_et_releve(
     assert contexte["document"].status is DocumentStatus.FAILED
     assert contexte["session"].job.status is JobStatus.FAILED
     assert "500" in (contexte["session"].job.error or "")
+
+
+async def test_un_depassement_de_delai_marque_le_document_en_echec(
+    contexte: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """arq coupe une tâche trop longue en l'**annulant** : aucune Exception n'est levée.
+
+    Reproduit sur la stack le 2026-09-13 : le document restait `transcribing` et
+    son job `running` pour toujours, et l'API refusait la relance. Sur un lot de
+    200 pages, rien n'aurait signalé la panne.
+    """
+
+    async def page_interminable(*args: Any, **kwargs: Any) -> OcrResult:
+        await asyncio.sleep(3600)
+        raise AssertionError("inatteignable")
+
+    monkeypatch.setattr("scriptoria.workers.tasks.transcribe_page", page_interminable)
+
+    # `wait_for` annule la tâche exactement comme le fait arq à `job_timeout`.
+    # L'annulation doit aussi être relancée : l'avaler empêcherait arq de conclure.
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(transcribe_document(contexte, str(contexte["document"].id)), 0.05)
+
+    assert contexte["document"].status is DocumentStatus.FAILED
+    assert contexte["session"].job.status is JobStatus.FAILED
+    assert "interrompu" in (contexte["session"].job.error or "")
 
 
 async def test_un_document_absent_n_est_pas_une_erreur(
