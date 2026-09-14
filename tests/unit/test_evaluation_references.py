@@ -14,12 +14,15 @@ from scriptoria.evaluation.references import (
 )
 
 
-def revision(numero: int, origine: str, texte: str, validee: bool = True) -> dict:
+def revision(
+    numero: int, origine: str, texte: str, validee: bool = True, en_lot: bool = False
+) -> dict:
     return {
         "revision": numero,
         "origin": origine,
         "content_markdown": texte,
         "is_validated": validee,
+        "bulk_validated": en_lot,
     }
 
 
@@ -38,6 +41,24 @@ def test_une_relecture_non_validee_n_est_pas_une_reference() -> None:
     ]
 
     assert derniere_revision(revisions, origine="human", validee=True) == "validée"
+
+
+def test_une_validation_en_lot_n_est_pas_une_reference() -> None:
+    """Valider d'un clic n'est pas relire : ce texte d'OCR donnerait 0 % d'erreur."""
+    revisions = [
+        revision(1, "ocr", "ocr", validee=False),
+        revision(2, "human", "relue une à une"),
+        revision(3, "human", "brouillon", validee=False),
+        revision(4, "human", "brouillon", en_lot=True),
+    ]
+
+    assert derniere_revision(revisions, origine="human", validee=True) == "relue une à une"
+
+
+def test_une_page_seulement_validee_en_lot_n_a_pas_de_reference() -> None:
+    revisions = [revision(1, "ocr", "ocr", validee=False), revision(2, "human", "ocr", en_lot=True)]
+
+    assert derniere_revision(revisions, origine="human", validee=True) is None
 
 
 def test_sans_revision_de_cette_origine_rien_n_est_rendu() -> None:

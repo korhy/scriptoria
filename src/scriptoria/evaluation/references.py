@@ -29,12 +29,16 @@ def derniere_revision(
     """Texte de la révision de plus haut numéro pour cette origine, ou `None`.
 
     `validee` écarte les révisions non validées : un brouillon enregistré sans
-    validation n'engage pas le relecteur.
+    validation n'engage pas le relecteur. Elle écarte aussi les validations **en
+    lot** : valider d'un clic toutes les pages d'un document n'est pas les relire,
+    et le texte d'OCR ainsi approuvé donnerait 0 % d'erreur là où personne n'a
+    regardé.
     """
     candidates = [
         revision
         for revision in revisions
-        if revision["origin"] == origine and (revision["is_validated"] or not validee)
+        if revision["origin"] == origine
+        and (not validee or (revision["is_validated"] and not revision["bulk_validated"]))
     ]
     if not candidates:
         return None

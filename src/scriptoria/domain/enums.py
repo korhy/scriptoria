@@ -30,6 +30,21 @@ class TranscriptionOrigin(StrEnum):
     HUMAN = "human"
 
 
+class PageState(StrEnum):
+    """Où en est la relecture d'une page — ce qu'affiche chaque vignette de l'UI.
+
+    `validated` suit le critère du document : une page l'est dès qu'**une** de ses
+    révisions a été validée, même si un brouillon plus récent a suivi.
+    """
+
+    UNTRANSCRIBED = "untranscribed"
+    # Dernière révision sortie de l'OCR, que personne n'a encore approuvée.
+    TO_REVIEW = "to_review"
+    # Correction humaine enregistrée sans validation.
+    DRAFT = "draft"
+    VALIDATED = "validated"
+
+
 class JobStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"

@@ -120,3 +120,207 @@ def cle_widget(prefixe: str, options: list[str]) -> str:
     """
     empreinte = hashlib.sha256("\n".join(options).encode()).hexdigest()[:12]
     return f"{prefixe}-{empreinte}"
+
+
+# --- Galerie de validation ---------------------------------------------------------
+#
+# Les pages manipulées ici sont celles de `GET /documents/{id}/pages` : état,
+# score de la dernière révision, validation en lot.
+
+# Aligné sur CONFIDENCE_SECOND_PASS_THRESHOLD : en dessous, la page mérite l'œil.
+SEUIL_ALERTE = 0.5
+# Vignettes affichées à la fois : 200 images d'un coup alourdiraient chaque clic.
+TAILLE_PAQUET = 24
+
+_ICONES = {
+    "untranscribed": ("⬜", "non transcrite"),
+    "to_review": ("👁️", "à relire"),
+    "draft": ("✏️", "brouillon"),
+    "validated": ("✅", "validée"),
+}
+_VALIDEE_EN_LOT = ("☑️", "validée en lot")
+_ICONE_ALERTE = "⚠️"
+# Statuts où chaque page porte une lecture à approuver, ou l'a déjà été — ceux
+# que l'API accepte pour la validation groupée.
+_STATUTS_VALIDABLES = frozenset({"awaiting_validation", "validated", "indexed"})
+
+
+@dataclass(frozen=True)
+class Vignette:
+    icone: str
+    libelle: str
+    score: str
+    alerte: bool
+
+
+@dataclass(frozen=True)
+class Avancement:
+    validees: int
+    total: int
+    # Numéros des pages dont le score est sous le seuil, validées en lot comprises.
+    alertes: tuple[int, ...]
+
+
+def _validee(page: dict) -> bool:
+    return page["state"] == "validated"
+
+
+def _alerte(page: dict) -> bool:
+    score = page["confidence_score"]
+    return score is not None and score < SEUIL_ALERTE
+
+
+def _pluriel(nombre: int, mot: str) -> str:
+    return f"{nombre} {mot}{'s' if nombre > 1 else ''}"
+
+
+def _numeros(numeros: list[int] | tuple[int, ...]) -> str:
+    return "p. " + ", ".join(str(numero) for numero in numeros)
+
+
+def format_score(score: float | None) -> str:
+    return "—" if score is None else f"{score:.2f}".replace(".", ",")
+
+
+def vignette(page: dict) -> Vignette:
+    """Ce que dit la vignette d'une page.
+
+    L'alerte prend la place de l'icône d'état, **validée en lot comprise** : une
+    page douteuse approuvée sans être lue est précisément celle qu'il faudra
+    rouvrir. Le libellé, lui, garde l'état.
+    """
+    if _validee(page) and page["bulk_validated"]:
+        icone, libelle = _VALIDEE_EN_LOT
+    else:
+        icone, libelle = _ICONES.get(page["state"], ("❔", page["state"]))
+    alerte = _alerte(page)
+    return Vignette(
+        icone=_ICONE_ALERTE if alerte else icone,
+        libelle=libelle,
+        score=format_score(page["confidence_score"]),
+        alerte=alerte,
+    )
+
+
+def libelle_vignette(page: dict) -> str:
+    etat = vignette(page)
+    return f"{etat.icone} p. {page['page_number']} · {etat.score}"
+
+
+_FILTRES = {
+    "toutes": lambda page: True,
+    "à relire": lambda page: not _validee(page),
+    "alertes": _alerte,
+    "validées": _validee,
+}
+FILTRES_GALERIE = tuple(_FILTRES)
+
+
+def filtrer_pages(pages: list[dict], filtre: str) -> list[dict]:
+    if filtre not in _FILTRES:
+        raise ValueError(f"filtre de galerie inconnu : {filtre!r}")
+    return [page for page in pages if _FILTRES[filtre](page)]
+
+
+def _position(pages: list[dict], page_id: str | None) -> int | None:
+    return next((index for index, page in enumerate(pages) if page["id"] == page_id), None)
+
+
+def page_voisine(pages: list[dict], page_id: str, pas: int) -> str | None:
+    """Identifiant de la page `pas` rangs plus loin, ou `None` au bord de la liste."""
+    position = _position(pages, page_id)
+    if position is None:
+        return None
+    cible = position + pas
+    return pages[cible]["id"] if 0 <= cible < len(pages) else None
+
+
+def prochaine_a_relire(pages: list[dict], page_id: str | None) -> str | None:
+    """Première page non validée après la page ouverte, en reprenant au début.
+
+    Jamais la page ouverte elle-même : « prochaine » veut dire ailleurs. Une page
+    validée en lot n'est plus à relire — son alerte, elle, reste visible.
+    """
+    position = _position(pages, page_id)
+    ordre = pages if position is None else pages[position + 1 :] + pages[:position]
+    return next((page["id"] for page in ordre if not _validee(page)), None)
+
+
+def avancement(pages: list[dict]) -> Avancement:
+    return Avancement(
+        validees=sum(1 for page in pages if _validee(page)),
+        total=len(pages),
+        alertes=tuple(page["page_number"] for page in pages if _alerte(page)),
+    )
+
+
+def libelle_avancement(etat: Avancement) -> str:
+    pages = "pages validées" if etat.total > 1 else "page validée"
+    texte = f"{etat.validees} / {etat.total} {pages}"
+    if etat.alertes:
+        texte += f" · {_pluriel(len(etat.alertes), 'alerte')} ({_numeros(etat.alertes)})"
+    return texte
+
+
+def refus_validation_groupee(document: dict, pages: list[dict]) -> str | None:
+    """Pourquoi le bouton « tout valider » est inactif — `None` s'il peut servir.
+
+    Mêmes règles que l'API, qui reste seule juge : l'UI ne fait qu'éviter un clic
+    voué au refus, et dire pourquoi.
+    """
+    restantes = [page for page in pages if not _validee(page)]
+    if not restantes:
+        return "Toutes les pages sont déjà validées."
+    if document["status"] not in _STATUTS_VALIDABLES:
+        return (
+            f"Document « {_statut(document)} » : la validation groupée attend la fin "
+            "de la transcription."
+        )
+    non_transcrites = [
+        page["page_number"] for page in restantes if page["state"] == "untranscribed"
+    ]
+    if non_transcrites:
+        return (
+            f"Pages sans transcription ({_numeros(non_transcrites)}) : lancer l'OCR ou "
+            "saisir leur texte d'abord."
+        )
+    return None
+
+
+def confirmation_validation_groupee(pages: list[dict]) -> str:
+    """Ce que le relecteur approuve en cliquant — pages douteuses nommées."""
+    restantes = [page for page in pages if not _validee(page)]
+    texte = f"Valider {_pluriel(len(restantes), 'page')} sans les relire une à une."
+    alertes = [page["page_number"] for page in restantes if _alerte(page)]
+    if alertes:
+        verbe = "porte" if len(alertes) == 1 else "portent"
+        texte += f" Parmi elles, {len(alertes)} {verbe} une alerte : {_numeros(alertes)}."
+    return (
+        texte + " Elles resteront marquées « validée en lot » et ne serviront pas de "
+        "référence pour mesurer l'OCR."
+    )
+
+
+def revisions_affichees(pages: list[dict]) -> dict[str, int]:
+    """La dernière révision de chaque page, telle que la galerie l'affiche (0 sans texte)."""
+    return {page["id"]: page["latest_revision"] or 0 for page in pages}
+
+
+def texte_modifie(saisi: str, original: str) -> bool:
+    return saisi.strip() != original.strip()
+
+
+def decouper(pages: list[dict], taille: int = TAILLE_PAQUET) -> list[list[dict]]:
+    return [pages[debut : debut + taille] for debut in range(0, len(pages), taille)]
+
+
+def index_paquet(paquets: list[list[dict]], page_id: str | None) -> int:
+    """Le paquet qui contient la page ouverte, le premier sinon."""
+    return next(
+        (index for index, paquet in enumerate(paquets) if _position(paquet, page_id) is not None),
+        0,
+    )
+
+
+def libelle_paquet(paquet: list[dict]) -> str:
+    return f"p. {paquet[0]['page_number']}-{paquet[-1]['page_number']}"

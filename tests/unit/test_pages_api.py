@@ -85,6 +85,9 @@ def revision_ocr(page_id: UUID, revision: int = 1, *, validee: bool = False) -> 
         origin=TranscriptionOrigin.OCR,
         model_name="qwen2.5vl:7b",
         is_validated=validee,
+        # Le défaut de la colonne ne s'applique qu'à l'écriture en base : un objet
+        # construit en mémoire doit le porter lui-même.
+        bulk_validated=False,
         created_at=datetime.now(UTC),
         confidence_blocks=[
             ConfidenceBlock(start_offset=0, end_offset=10, score=0.15, method="arithmetic")

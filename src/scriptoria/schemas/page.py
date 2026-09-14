@@ -4,9 +4,9 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, StringConstraints
 
-from scriptoria.domain.enums import DocumentStatus, TranscriptionOrigin
+from scriptoria.domain.enums import DocumentStatus, PageState, TranscriptionOrigin
 
 
 class ConfidenceBlockRead(BaseModel):
@@ -29,6 +29,8 @@ class TranscriptionRead(BaseModel):
     origin: TranscriptionOrigin
     model_name: str | None
     is_validated: bool
+    # Validée d'un clic avec tout le document : approuvée, pas forcément lue.
+    bulk_validated: bool
     created_at: datetime
     confidence_blocks: list[ConfidenceBlockRead] = Field(default_factory=list)
 
@@ -41,6 +43,20 @@ class PageRead(BaseModel):
     page_number: int
     raw_image_path: str
     preprocessed_image_path: str | None
+
+
+class PageSummary(PageRead):
+    """Une vignette de la galerie : où en est la page, et faut-il la lire d'abord.
+
+    Aucun champ n'a de valeur par défaut : une route qui oublierait d'en calculer
+    un doit échouer, pas afficher « à relire » sur une page validée.
+    """
+
+    state: PageState
+    # Score de la dernière révision ; `None` pour une page jamais transcrite.
+    confidence_score: float | None
+    latest_revision: int | None
+    bulk_validated: bool
 
 
 class PageDetail(PageRead):
@@ -81,4 +97,23 @@ class RevisionCreated(BaseModel):
     revision: int
     origin: TranscriptionOrigin
     is_validated: bool
+    document_status: DocumentStatus
+
+
+class BulkValidationRequest(BaseModel):
+    """Valider d'un geste toutes les pages restantes d'un document.
+
+    `expected_revisions` porte, pour **chaque** page, la dernière révision que le
+    relecteur avait à l'écran (0 pour une page sans transcription). Si la base a
+    bougé depuis, rien n'est validé : on n'approuve pas un texte que personne n'a
+    vu passer.
+    """
+
+    expected_revisions: dict[UUID, NonNegativeInt]
+
+
+class BulkValidationResult(BaseModel):
+    validated_pages: list[int]
+    # Pages qui l'étaient déjà : laissées telles quelles, sans révision de plus.
+    already_validated: int
     document_status: DocumentStatus

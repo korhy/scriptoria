@@ -15,16 +15,19 @@ from arq.connections import ArqRedis
 from arq.jobs import Job as ArqJob
 from arq.jobs import JobStatus as ArqJobStatus
 from elasticsearch import ApiError, TransportError
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import delete, distinct, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from scriptoria.api.deps import AppSettings, DbSession, EsClient, TaskQueue
+from scriptoria.config import Settings
 from scriptoria.db.models import Document, Job, Page, Transcription
 from scriptoria.domain.enums import DocumentStatus, JobStatus, TranscriptionOrigin
 from scriptoria.schemas.document import DocumentRead, JobAccepted
-from scriptoria.schemas.page import PageRead
+from scriptoria.schemas.page import BulkValidationRequest, BulkValidationResult, PageSummary
 from scriptoria.services.storage import (
     MAX_PAGE_BYTES,
     MAX_PAGES_PER_DOCUMENT,
@@ -34,6 +37,16 @@ from scriptoria.services.storage import (
     validate_image_suffix,
     write_page_bytes,
 )
+from scriptoria.services.thumbnails import UnreadableImageError, render_thumbnail
+from scriptoria.services.validation import (
+    BulkValidationConflictError,
+    is_bulk_validated,
+    latest_revision,
+    page_score,
+    page_state,
+    prepare_bulk_validation,
+    validate_document_if_complete,
+)
 from scriptoria.workers import PREPROCESS_TASK, TRANSCRIBE_TASK
 
 logger = logging.getLogger(__name__)
@@ -41,6 +54,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+ImageVariant = Literal["raw", "preprocessed"]
+
+# Vignettes de la galerie : assez larges pour reconnaître une page, assez étroites
+# pour ne pas renvoyer l'image entière réencodée.
+THUMBNAIL_MIN_WIDTH = 64
+THUMBNAIL_MAX_WIDTH = 512
+THUMBNAIL_DEFAULT_WIDTH = 240
+
+# Statuts où chaque page porte une lecture à approuver, ou l'a déjà été. Pendant
+# un OCR, des pages restent à lire : valider maintenant les laisserait de côté.
+_REVIEWABLE_STATUSES = frozenset(
+    {DocumentStatus.AWAITING_VALIDATION, DocumentStatus.VALIDATED, DocumentStatus.INDEXED}
+)
 
 # États arq d'un job qui peut encore écrire sur un document.
 _ARQ_ACTIVE_STATUSES = frozenset(
@@ -221,29 +248,114 @@ async def delete_document(
     logger.info("document %s supprimé : index, base et fichiers", document_id)
 
 
-@router.get("/{document_id}/pages", response_model=list[PageRead], summary="Pages d'un document")
-async def list_pages(document_id: UUID, session: DbSession) -> list[Page]:
+async def _load_pages(session: AsyncSession, document_id: UUID) -> list[Page]:
+    """Pages du document, révisions et blocs compris — trois requêtes, quel qu'en soit le nombre."""
     result = await session.execute(
-        select(Page).where(Page.document_id == document_id).order_by(Page.page_number)
+        select(Page)
+        .where(Page.document_id == document_id)
+        .order_by(Page.page_number)
+        .options(selectinload(Page.transcriptions).selectinload(Transcription.confidence_blocks))
     )
-    pages = list(result.scalars().all())
-    if not pages and await session.get(Document, document_id) is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "document introuvable")
-    return pages
+    return list(result.scalars().all())
+
+
+def _to_summary(page: Page) -> PageSummary:
+    latest = latest_revision(page)
+    return PageSummary(
+        id=page.id,
+        document_id=page.document_id,
+        page_number=page.page_number,
+        raw_image_path=page.raw_image_path,
+        preprocessed_image_path=page.preprocessed_image_path,
+        state=page_state(page),
+        confidence_score=page_score(page),
+        latest_revision=None if latest is None else latest.revision,
+        bulk_validated=is_bulk_validated(page),
+    )
 
 
 @router.get(
-    "/{document_id}/pages/{page_number}/image",
-    response_class=FileResponse,
-    summary="Image d'une page (brute ou prétraitée)",
+    "/{document_id}/pages",
+    response_model=list[PageSummary],
+    summary="Pages d'un document, avec l'état et le score de chacune",
 )
-async def get_page_image(
+async def list_pages(document_id: UUID, session: DbSession) -> list[PageSummary]:
+    """De quoi afficher toute la galerie en un appel, jamais un par page."""
+    pages = await _load_pages(session, document_id)
+    if not pages and await session.get(Document, document_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "document introuvable")
+    return [_to_summary(page) for page in pages]
+
+
+@router.post(
+    "/{document_id}/validate",
+    response_model=BulkValidationResult,
+    summary="Valide d'un geste toutes les pages restantes du document",
+)
+async def validate_document(
+    document_id: UUID,
+    payload: BulkValidationRequest,
+    session: DbSession,
+    queue: TaskQueue,
+) -> BulkValidationResult:
+    """Ajoute à chaque page non validée une révision `n+1` validée **en lot**.
+
+    Une seule transaction, une seule indexation enfilée. Le texte approuvé est
+    celui de la dernière révision, tel quel, et ses blocs de confiance le suivent :
+    une page douteuse validée sans être lue garde son alerte. La révision porte
+    `bulk_validated`, ce qui l'écarte des références d'évaluation.
+
+    Refusé (409), sans rien écrire, si le document n'est pas entièrement transcrit
+    ou si une page a changé depuis que le relecteur l'a affichée.
+    """
+    document = await session.get(Document, document_id)
+    if document is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "document introuvable")
+    if document.status not in _REVIEWABLE_STATUSES:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"document au statut '{document.status.value}' : seul un document entièrement "
+            "transcrit peut être validé.",
+        )
+
+    pages = await _load_pages(session, document_id)
+    try:
+        approvals = prepare_bulk_validation(pages, payload.expected_revisions)
+    except BulkValidationConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+    pages_by_id = {page.id: page for page in pages}
+    for approval in approvals:
+        # Par la relation : le contrôle de complétude relit ces collections.
+        pages_by_id[approval.page_id].transcriptions.append(approval)
+
+    if approvals:
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            # Deux validations simultanées visent la même révision `n+1`.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "une autre validation vient d'écrire sur ces pages : recharger.",
+            ) from exc
+        await validate_document_if_complete(session, document, queue)
+
+    validated = [pages_by_id[approval.page_id].page_number for approval in approvals]
+    logger.info("document %s : %d page(s) validée(s) en lot", document_id, len(validated))
+    return BulkValidationResult(
+        validated_pages=validated,
+        already_validated=len(pages) - len(approvals),
+        document_status=document.status,
+    )
+
+
+async def _page_image_path(
+    session: AsyncSession,
+    settings: Settings,
     document_id: UUID,
     page_number: int,
-    session: DbSession,
-    settings: AppSettings,
-    variant: Literal["raw", "preprocessed"] = "preprocessed",
-) -> FileResponse:
+    variant: ImageVariant,
+) -> Path:
     result = await session.execute(
         select(Page).where(Page.document_id == document_id, Page.page_number == page_number)
     )
@@ -263,7 +375,52 @@ async def get_page_image(
     # doit pas pouvoir faire servir un fichier arbitraire de la machine.
     if not path.is_relative_to(settings.data_dir.resolve()) or not path.is_file():
         raise HTTPException(status.HTTP_404_NOT_FOUND, "fichier absent")
-    return FileResponse(path)
+    return path
+
+
+@router.get(
+    "/{document_id}/pages/{page_number}/image",
+    response_class=FileResponse,
+    summary="Image d'une page (brute ou prétraitée)",
+)
+async def get_page_image(
+    document_id: UUID,
+    page_number: int,
+    session: DbSession,
+    settings: AppSettings,
+    variant: ImageVariant = "preprocessed",
+) -> FileResponse:
+    return FileResponse(
+        await _page_image_path(session, settings, document_id, page_number, variant)
+    )
+
+
+@router.get(
+    "/{document_id}/pages/{page_number}/thumbnail",
+    response_class=Response,
+    responses={200: {"content": {"image/jpeg": {}}}},
+    summary="Vignette JPEG d'une page, pour la galerie",
+)
+async def get_page_thumbnail(
+    document_id: UUID,
+    page_number: int,
+    session: DbSession,
+    settings: AppSettings,
+    width: Annotated[
+        int, Query(ge=THUMBNAIL_MIN_WIDTH, le=THUMBNAIL_MAX_WIDTH)
+    ] = THUMBNAIL_DEFAULT_WIDTH,
+    variant: ImageVariant = "preprocessed",
+) -> Response:
+    """Réduite et réencodée à la volée, jamais stockée (`services/thumbnails.py`)."""
+    path = await _page_image_path(session, settings, document_id, page_number, variant)
+    try:
+        # Décodage et réencodage bloquants : déportés dans un thread.
+        content = await anyio.to_thread.run_sync(render_thumbnail, path, width)
+    except UnreadableImageError as exc:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"{exc} : le fichier existe mais ne se décode pas."
+        ) from exc
+    return Response(content=content, media_type="image/jpeg")
 
 
 async def _read_bounded(upload: UploadFile) -> bytes:

@@ -220,7 +220,8 @@ texte libre n'offre aucune prise à ces contrôles.
 ### Validation : ce qui reste à brancher (2026-09-12)
 
 Un document passe en `VALIDATED` dès que **chacune** de ses pages porte une
-révision validée — il n'existe pas d'approbation globale. L'indexation est alors
+révision validée — page par page, ou d'un geste par la validation groupée (voir
+plus bas), qui ajoute une révision à chacune. L'indexation est alors
 **enfilée** (job `index`), jamais exécutée dans la requête : vectoriser 200 pages
 prend des minutes.
 
@@ -539,6 +540,57 @@ par lot plutôt que par page.
 **Non vérifié** : le coût mémoire de 8 192 jetons de fenêtre, estimé à ~0,5 Go de
 cache de plus que 4 096 pour mistral 7B, sur une machine déjà à la limite.
 
+### Écran de validation : galerie et validation groupée (2026-09-14)
+
+L'écran Validation devient un lecteur de pages : une galerie de vignettes à
+gauche, la page ouverte (image | Markdown) à droite.
+
+- **Galerie** : `GET /documents/{id}/pages` rend pour chaque page `state`
+  (`untranscribed`, `to_review`, `draft`, `validated`), `confidence_score` (dernière
+  révision), `latest_revision` et `bulk_validated`, en trois requêtes quel que soit
+  le nombre de pages. Champs obligatoires, sans défaut. Vignettes :
+  `GET …/pages/{n}/thumbnail?width=` (64 à 512 px, JPEG réencodé par OpenCV dans un
+  thread, jamais stocké), mises en cache côté UI.
+- **Navigation** : clic sur une vignette, Précédente / Suivante (touches ← →),
+  « Prochaine à relire », et passage à la suivante après une validation. Paquets de
+  24 vignettes ; filtres toutes / à relire / alertes / validées. Changer de page est
+  refusé tant que l'éditeur porte des modifications non enregistrées.
+- **Validation groupée** `POST /documents/{id}/validate` : chaque page non validée
+  reçoit une révision `n+1` `human` validée **et marquée `bulk_validated`**. Une
+  transaction, une seule indexation enfilée.
+  - Le corps porte **la révision affichée de chaque page** (`expected_revisions`).
+    Page ajoutée, retirée, transcrite ou corrigée depuis ⇒ 409, rien n'est écrit.
+    Deux validations simultanées ⇒ la contrainte d'unicité tranche : 409, pas 500.
+  - Refusée hors `awaiting_validation` / `validated` / `indexed`, ou si une page n'a
+    aucune transcription.
+  - **Les blocs de confiance sont recopiés** sur la révision validée en lot (même
+    texte, mêmes offsets). Sans cela, une page douteuse perdrait son alerte au
+    moment même où on la valide sans la lire.
+  - **`bulk_validated` écarte la révision des références d'évaluation**
+    (`evaluation/references.py`) : valider d'un clic n'est pas relire, et le texte
+    d'OCR ainsi approuvé afficherait 0 % d'erreur. La révision est indexée comme
+    les autres.
+  - Pages en alerte incluses (décidé le 2026-09-14) : la confirmation les nomme
+    avant le clic.
+- Colonne `transcriptions.bulk_validated` (migration `5c1e0b7a9d42`, défaut faux).
+  Règles partagées par les deux gestes de validation dans `services/validation.py`.
+
+**Deux pièges rencontrés :**
+
+- Une `Transcription` construite en mémoire porte `bulk_validated = None` tant
+  qu'elle n'est pas écrite : le défaut de colonne ne s'applique qu'à l'`INSERT`.
+  Un double de test qui l'omet fait échouer la sérialisation (500).
+- **Streamlit garde en mémoire les modules importés** (`presentation`) : après une
+  modification, l'UI plante sur un nom introuvable jusqu'à
+  `docker compose restart ui`.
+
+Vérifié : 458 tests unitaires ; `test_bulk_validation.py` sur la stack (6 tests,
+OCR réel, document supprimé à la fin). Dans le navigateur, sur le règlement de 44
+pages et **sans rien valider** : ouverture sur la première page à relire (p. 6), →
+mène à la p. 7, clic sur la vignette 1 mène à la p. 1, → tapé dans l'éditeur ne
+change pas de page, la confirmation groupée annonce 39 pages, et « Suivante » est
+refusée avec un avertissement tant que l'éditeur porte un texte modifié.
+
 ### Tests d'intégration : ce qu'ils couvrent (2026-09-12)
 
 `tests/integration/` parle à la vraie stack. 26 tests, ~4 minutes, Ollama requis.
@@ -555,6 +607,7 @@ ne se voient que là.
 | `test_validation_indexing.py` | révision `n+1` sans écrasement, fragment indexé (1024 dim), correction qui **remplace** le fragment, `reindex` idempotent |
 | `test_search_pipeline.py` | recherche hybride, réponse avec sources, **fausse consigne citée sans être exécutée**, début d'un passage long conservé |
 | `test_document_deletion.py` | suppression complète (base par cascade, fragments ES, dossiers), job mort dans arq non bloquant |
+| `test_bulk_validation.py` | galerie et vignette d'une page OCRisée ; validation groupée : révision périmée refusée sans écriture, révision `n+1` en lot, blocs de confiance recopiés, seconde validation sans effet |
 
 Deux règles apprises en les écrivant, à respecter pour en ajouter :
 

@@ -156,7 +156,8 @@ def render_actions(documents: list[dict]) -> None:
         st.error(f"OCR refusé (HTTP {code}) : {api_client.detail(corps)}")
 
     if relire.button("✎ Relire", disabled=document["status"] not in _APRES_OCR, width="stretch"):
-        st.session_state["cible_validation"] = {"document_id": document_id, "page_number": 1}
+        # Aucune page imposée : l'écran de validation ouvre la première à relire.
+        st.session_state["cible_validation"] = {"document_id": document_id, "page_number": None}
         st.switch_page("page_validation.py")
 
     with supprimer.popover("🗑 Supprimer", width="stretch"):
