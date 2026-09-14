@@ -41,6 +41,7 @@ from scriptoria.services.indexing import (
     index_chunks,
     validate_embedding_dim,
 )
+from scriptoria.services.normalization import normalize_document
 from scriptoria.services.ocr import OcrResult, transcribe_page
 from scriptoria.services.preprocessing import preprocess_page
 from scriptoria.services.storage import preprocessed_page_relpath
@@ -305,12 +306,20 @@ async def transcribe_document(ctx: dict[str, Any], document_id: str) -> None:
                     len(blocks),
                 )
 
+            # Même transaction que le changement de statut : le relecteur n'ouvre
+            # jamais un document dont la mise en forme manquerait. Rejouée à chaque
+            # relance, elle saute les pages déjà mises en forme ou relues.
+            normalized = await normalize_document(session, doc_id)
             document.status = DocumentStatus.AWAITING_VALIDATION
             await _update_job(session, doc_id, "transcribe", JobStatus.DONE)
             await session.commit()
 
         logger.info(
-            "document %s transcrit (%s pages, %s déjà faites)", doc_id, transcribed, skipped
+            "document %s transcrit (%s pages, %s déjà faites, %s mises en forme)",
+            doc_id,
+            transcribed,
+            skipped,
+            normalized,
         )
 
     except (Exception, asyncio.CancelledError) as exc:

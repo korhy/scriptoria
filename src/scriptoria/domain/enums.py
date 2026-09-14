@@ -28,6 +28,10 @@ class TranscriptionOrigin(StrEnum):
 
     OCR = "ocr"
     HUMAN = "human"
+    # Mise en forme automatique d'une sortie OCR : césures recollées, lignes remises
+    # en paragraphes, numéros de page retirés. Jamais validée d'office, et la
+    # révision `ocr` qui la précède reste intacte.
+    NORMALIZED = "normalized"
 
 
 class PageState(StrEnum):

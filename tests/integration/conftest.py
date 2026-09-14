@@ -136,7 +136,7 @@ def document_indexe(api: httpx.Client, ollama_pret: None, attendre) -> dict[str,
     Une seule fois pour toute la session : chaque passage OCR coûte ~35 s, et
     toutes les assertions en aval portent sur le même document.
 
-    La validation reprend **le texte de l'OCR tel quel** — c'est le geste d'un
+    La validation reprend **le texte affiché tel quel** — c'est le geste d'un
     relecteur qui approuve sans corriger, et il crée quand même une révision.
     """
     document = importer_page(api, nom="reference.png")
@@ -150,16 +150,24 @@ def document_indexe(api: httpx.Client, ollama_pret: None, attendre) -> dict[str,
 
     page = premiere_page(api, document["id"])
     detail = api.get(f"/pages/{page['id']}").json()
-    texte_ocr = detail["transcriptions"][-1]["content_markdown"]
+    # Révision 1 de l'OCR, puis sa mise en forme si la page en avait besoin : le
+    # relecteur approuve ce qu'il a sous les yeux, la dernière des deux.
+    texte_ocr = detail["transcriptions"][0]["content_markdown"]
+    texte_affiche = detail["transcriptions"][-1]["content_markdown"]
 
     validation = api.post(
         f"/pages/{page['id']}/corrections",
-        json={"content_markdown": texte_ocr, "validate_now": True},
+        json={"content_markdown": texte_affiche, "validate_now": True},
     )
     assert validation.status_code == 201, validation.text
     attendre(document["id"], "indexed")
 
-    return {"document_id": document["id"], "page_id": page["id"], "texte_ocr": texte_ocr}
+    return {
+        "document_id": document["id"],
+        "page_id": page["id"],
+        "texte_ocr": texte_ocr,
+        "texte_affiche": texte_affiche,
+    }
 
 
 def attendre_fragment(

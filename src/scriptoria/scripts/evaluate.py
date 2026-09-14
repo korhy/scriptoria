@@ -23,6 +23,7 @@ import logging
 import mimetypes
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict
 from datetime import UTC, datetime
 from itertools import batched
@@ -40,6 +41,7 @@ from scriptoria.evaluation.rapport import ResultatQuestion, construire_rapport, 
 from scriptoria.evaluation.references import (
     RELECTURE,
     SAISIE,
+    derniere_lecture_automatique,
     derniere_revision,
     fusionner_references,
 )
@@ -137,23 +139,31 @@ def transcrire(api: httpx.Client, document_id: str, settings: Settings) -> None:
 
 
 def lire_revisions(api: httpx.Client, document_id: str) -> tuple[dict[int, str], dict[int, str]]:
-    """Par page : la dernière sortie de l'OCR, et la dernière relecture validée.
+    """Par page : la dernière lecture de la machine, et la dernière relecture validée.
 
-    La première est ce qu'on mesure. La seconde sert de référence là où aucune page
-    n'a été saisie en fichier : relire dans l'UI suffit à faire avancer la mesure.
+    La première est ce qu'on mesure : la mise en forme si la page en a une, sinon la
+    sortie brute de l'OCR (voir `derniere_lecture_automatique`). La seconde sert de
+    référence là où aucune page n'a été saisie en fichier : relire dans l'UI suffit
+    à faire avancer la mesure.
     """
     pages = _verifier(api.get(f"/documents/{document_id}/pages"), 200, "lecture des pages")
-    ocr: dict[int, str] = {}
+    lectures: dict[int, str] = {}
+    origines: Counter[str] = Counter()
     relectures: dict[int, str] = {}
     for page in pages:
         numero = page["page_number"]
         detail = _verifier(api.get(f"/pages/{page['id']}"), 200, f"lecture de la page {numero}")
         revisions = detail["transcriptions"]
-        if (texte := derniere_revision(revisions, origine="ocr")) is not None:
-            ocr[numero] = texte
+        if (lecture := derniere_lecture_automatique(revisions)) is not None:
+            lectures[numero], origine = lecture
+            origines[origine] += 1
         if (texte := derniere_revision(revisions, origine="human", validee=True)) is not None:
             relectures[numero] = texte
-    return ocr, relectures
+    print(
+        f"→ textes mesurés : {origines['normalized']} page(s) mise(s) en forme, "
+        f"{origines['ocr']} sortie(s) brute(s) de l'OCR"
+    )
+    return lectures, relectures
 
 
 # --- Recherche : index d'évaluation séparé ----------------------------------

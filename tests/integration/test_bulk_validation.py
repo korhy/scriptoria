@@ -35,7 +35,8 @@ def document_transcrit(
     (page,) = galerie.json()
     detail = api.get(f"/pages/{page['id']}").json()
 
-    yield {"document_id": document["id"], "page": page, "revision_ocr": detail["transcriptions"][0]}
+    # L'OCR laisse sa révision 1, suivie de sa mise en forme si la page en avait besoin.
+    yield {"document_id": document["id"], "page": page, "revisions": detail["transcriptions"]}
 
     suppression = api.delete(f"/documents/{document['id']}")
     assert suppression.status_code in (204, 404), suppression.text
@@ -77,9 +78,12 @@ def validation_groupee(
 
 def test_la_galerie_decrit_une_page_sortie_de_l_ocr(document_transcrit: dict[str, Any]) -> None:
     page = document_transcrit["page"]
+    revisions = document_transcrit["revisions"]
 
     assert page["state"] == "to_review"
-    assert page["latest_revision"] == 1
+    assert revisions[0]["origin"] == "ocr"
+    assert {revision["origin"] for revision in revisions} <= {"ocr", "normalized"}
+    assert page["latest_revision"] == revisions[-1]["revision"]
     assert page["confidence_score"] is not None
     assert page["bulk_validated"] is False
 
@@ -97,30 +101,31 @@ def test_la_vignette_est_un_jpeg_reduit(
 
 
 def test_une_validation_sur_une_revision_perimee_n_ecrit_rien(
-    validation_groupee: dict[str, Any],
+    validation_groupee: dict[str, Any], document_transcrit: dict[str, Any]
 ) -> None:
     assert validation_groupee["perimee"].status_code == 409
     assert "page 1" in validation_groupee["perimee"].json()["detail"]
-    assert validation_groupee["revisions_apres_refus"] == 1
+    assert validation_groupee["revisions_apres_refus"] == len(document_transcrit["revisions"])
 
 
 def test_la_validation_groupee_ajoute_une_revision_marquee_en_lot(
     validation_groupee: dict[str, Any], document_transcrit: dict[str, Any]
 ) -> None:
     assert validation_groupee["validation"]["validated_pages"] == [1]
-    ocr, validee = validation_groupee["detail"]["transcriptions"]
+    *precedentes, validee = validation_groupee["detail"]["transcriptions"]
+    affichee = precedentes[-1]
 
-    assert ocr == document_transcrit["revision_ocr"], "la révision OCR doit rester intacte"
-    assert (validee["revision"], validee["origin"]) == (2, "human")
+    assert precedentes == document_transcrit["revisions"], "rien ne doit être réécrit"
+    assert (validee["revision"], validee["origin"]) == (affichee["revision"] + 1, "human")
     assert (validee["is_validated"], validee["bulk_validated"]) == (True, True)
-    assert validee["content_markdown"] == ocr["content_markdown"]
+    assert validee["content_markdown"] == affichee["content_markdown"]
 
 
 def test_la_validation_groupee_garde_les_alertes_de_la_page(
     validation_groupee: dict[str, Any],
 ) -> None:
     """Les blocs relus en base, pas seulement préparés en mémoire."""
-    ocr, validee = validation_groupee["detail"]["transcriptions"]
+    *_, affichee, validee = validation_groupee["detail"]["transcriptions"]
 
     def blocs(revision: dict[str, Any]) -> list[tuple[Any, ...]]:
         return sorted(
@@ -128,7 +133,7 @@ def test_la_validation_groupee_garde_les_alertes_de_la_page(
             for b in revision["confidence_blocks"]
         )
 
-    assert blocs(validee) == blocs(ocr)
+    assert blocs(validee) == blocs(affichee)
 
 
 def test_une_seconde_validation_groupee_ne_fait_rien(validation_groupee: dict[str, Any]) -> None:

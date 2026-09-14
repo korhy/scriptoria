@@ -20,6 +20,7 @@ from scriptoria.config import Settings
 from scriptoria.db.models import Document, Job, Page, Transcription
 from scriptoria.domain.enums import DocumentStatus, JobStatus, TranscriptionOrigin
 from scriptoria.services.confidence import METHOD_ARITHMETIC, METHOD_DOUBLE_PASS
+from scriptoria.services.layout import LayoutError
 from scriptoria.services.ocr import OcrError, OcrResult
 from scriptoria.workers.tasks import transcribe_document
 
@@ -411,3 +412,73 @@ async def test_un_seuil_a_zero_desactive_le_second_passage(
     await transcribe_document(contexte, str(contexte["document"].id))
 
     assert len(passages_simules) == 1
+
+
+# --- Mise en forme ----------------------------------------------------------
+
+
+@pytest.fixture
+def mises_en_forme(monkeypatch: pytest.MonkeyPatch) -> list[DocumentStatus]:
+    """Remplace la mise en forme et retient le statut du document au moment de l'appel."""
+    appels: list[DocumentStatus] = []
+
+    async def fausse_mise_en_forme(session: Any, document_id: UUID) -> int:
+        appels.append(session.document.status)
+        return 0
+
+    monkeypatch.setattr("scriptoria.workers.tasks.normalize_document", fausse_mise_en_forme)
+    return appels
+
+
+async def test_la_mise_en_forme_suit_l_ocr_avant_la_mise_en_attente_de_validation(
+    contexte: dict[str, Any],
+    transcriptions_simulees: list[Path],
+    mises_en_forme: list[DocumentStatus],
+) -> None:
+    """Le relecteur ouvre un document déjà mis en forme, jamais la sortie brute seule."""
+    await transcribe_document(contexte, str(contexte["document"].id))
+
+    assert mises_en_forme == [DocumentStatus.TRANSCRIBING]
+    assert contexte["document"].status is DocumentStatus.AWAITING_VALIDATION
+
+
+async def test_un_document_repris_sans_page_a_transcrire_est_quand_meme_mis_en_forme(
+    contexte: dict[str, Any],
+    transcriptions_simulees: list[Path],
+    mises_en_forme: list[DocumentStatus],
+) -> None:
+    """Un OCR interrompu juste après sa dernière page se met en forme à la relance."""
+    for cible in contexte["session"].pages:
+        cible.transcriptions = [
+            Transcription(
+                page_id=cible.id,
+                revision=1,
+                content_markdown="texte",
+                origin=TranscriptionOrigin.OCR,
+                model_name=MODELE,
+            )
+        ]
+
+    await transcribe_document(contexte, str(contexte["document"].id))
+
+    assert transcriptions_simulees == []
+    assert len(mises_en_forme) == 1
+
+
+async def test_une_mise_en_forme_refusee_marque_le_document_en_echec(
+    contexte: dict[str, Any],
+    transcriptions_simulees: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Le garde-fou a vu un caractère changer : mieux vaut un échec qu'un texte faussé."""
+
+    async def refus(session: Any, document_id: UUID) -> int:
+        raise LayoutError("la mise en forme a modifié le contenu de la page 2 : révision refusée")
+
+    monkeypatch.setattr("scriptoria.workers.tasks.normalize_document", refus)
+
+    with pytest.raises(LayoutError):
+        await transcribe_document(contexte, str(contexte["document"].id))
+
+    assert contexte["document"].status is DocumentStatus.FAILED
+    assert "page 2" in (contexte["session"].job.error or "")

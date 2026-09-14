@@ -591,9 +591,67 @@ mène à la p. 7, clic sur la vignette 1 mène à la p. 1, → tapé dans l'édi
 change pas de page, la confirmation groupée annonce 39 pages, et « Suivante » est
 refusée avec un avertissement tant que l'éditeur porte un texte modifié.
 
+### Mise en forme des transcriptions dactylographiées (2026-09-14)
+
+Relevé en relisant le règlement de 44 pages : le modèle recopie la mise en ligne de
+la machine à écrire — mots coupés en fin de ligne, phrases cassées, virgules
+collées, numéro de page une page sur deux, mot coupé entre deux pages.
+
+- **Une révision `n+1` d'origine `normalized`, jamais validée d'office**
+  (`services/normalization.py`, migration `9b3f6d2e8a14`). La révision `ocr` reste
+  la lecture brute : une mise en forme améliorée se rejoue sans repayer l'OCR. Le
+  worker la produit à la fin de `transcribe_document`, dans la même transaction que
+  le passage en `awaiting_validation` ; `make normalize DOCUMENT=<id>` la rejoue sur
+  un document déjà transcrit. Seules les pages dont la dernière révision est `ocr`
+  sont touchées : une relecture ne se réécrit pas, une mise en forme ne se double pas.
+- **Des règles fixes, pas un LLM** (`services/layout.py`), sous **garde-fou** :
+  lettres et chiffres, pages mises bout à bout, identiques avant et après. Sinon
+  `LayoutError`, rien n'est écrit, le document passe en `failed`.
+- **La plupart des tirets de fin de ligne ne coupent pas un mot.** Sur 272 relevés :
+  ~170 tirets de remplissage (`contrat-⏎ne contenait`), ~56 césures, ~17 nombres
+  composés. Recoller à l'aveugle donnait `contratne` — ce que fait encore
+  `evaluation/mesures.py`, sans conséquence depuis qu'il compare des textes mis en
+  forme. Chaque tiret est jugé avec un **lexique tiré des textes eux-mêmes**
+  (document, relectures validées), mots bordant un tiret exclus : nombre composé →
+  tiret gardé ; mot entier connu → césure ; deux mots connus → remplissage ; deux
+  moitiés inconnues → césure ; **un seul connu → laissé tel quel et signalé** (bloc
+  `structural`, `SCORE_UNCERTAIN_LINE_BREAK = 0,45`). Pas de dictionnaire externe.
+  **Sous 0,5, pas à 0,5** : l'UI ne montre qu'un score strictement sous `SEUIL_ALERTE`.
+  Vu dans le navigateur : à 0,5, les 17 doutes du règlement étaient en base et
+  invisibles. Gardé par `test_un_tiret_indecis_est_visible_dans_l_ecran_de_validation`.
+- Un remplissage avant une majuscule clôt l'alinéa, avant une énumération (`f)-`)
+  la ligne ; une ligne finie par un chiffre ou `°` (listes de lots) ne se recolle
+  pas ; les tableaux ne bougent pas ; `com - prenant`, déjà remis en ligne par le
+  modèle, est jugé comme un tiret de fin de ligne ; `Me DURAND - notaire` reste.
+- **Numéro de page retiré** seulement s'il suit une numérotation attestée par au
+  moins deux pages (ici décalée de 1). **Mot coupé entre deux pages** recollé sur
+  la page où il commence — jamais si l'une des deux a été relue.
+- **Blocs de confiance** : contrôles gratuits recalculés sur le nouveau texte ;
+  blocs `double_pass` reportés par la correspondance des positions
+  (`services/text_edits.py`), faute de second passage conservé ; un bloc dont le
+  texte a disparu est abandonné.
+- **L'évaluation mesure la révision mise en forme** quand elle existe
+  (`derniere_lecture_automatique`). Référence saisie : numéro de page omis.
+
+**Mesuré sur le règlement** (même OCR) : 43 pages sur 44 mises en forme ; tirets de
+fin de ligne 244 → 13 ; numéros de page en tête 29 → 0 ; virgules collées 51 → 0 ;
+17 cas indécis signalés sur 6 pages (7 en p. 39). Les relectures de test des pages
+1 à 10 ont été supprimées à la demande : le document est entièrement à relire, et
+ce corpus n'a plus aucune référence de relecture.
+
+**Limites connues** : une coupure remise en ligne sans tiret (`débar ras`) reste
+coupée ; une phrase à cheval sur deux pages aussi (la page est l'unité de relecture) ;
+les 13 tirets restants sont des remplissages dont un seul mot figure au lexique
+(`éventuelle-⏎au`). Un dictionnaire français local réduirait ce reste — écarté pour
+l'instant, à mesurer avant d'y revenir.
+
+Vérifié : 533 tests unitaires (couverture 87 %) ; sur la stack, `test_normalization.py`
+et les tests adaptés de `test_bulk_validation.py` et `test_validation_indexing.py`,
+18 tests verts.
+
 ### Tests d'intégration : ce qu'ils couvrent (2026-09-12)
 
-`tests/integration/` parle à la vraie stack. 26 tests, ~4 minutes, Ollama requis.
+`tests/integration/` parle à la vraie stack. 29 tests, ~4 minutes, Ollama requis.
 Ils existent parce que les tests unitaires remplacent Postgres, Elasticsearch et
 les modèles par des doubles : un champ mal nommé dans une requête ES, une
 dimension de vecteur désalignée ou une écriture qui duplique au lieu d'écraser
@@ -608,6 +666,7 @@ ne se voient que là.
 | `test_search_pipeline.py` | recherche hybride, réponse avec sources, **fausse consigne citée sans être exécutée**, début d'un passage long conservé |
 | `test_document_deletion.py` | suppression complète (base par cascade, fragments ES, dossiers), job mort dans arq non bloquant |
 | `test_bulk_validation.py` | galerie et vignette d'une page OCRisée ; validation groupée : révision périmée refusée sans écriture, révision `n+1` en lot, blocs de confiance recopiés, seconde validation sans effet |
+| `test_normalization.py` | révision `normalized` enregistrée (valeur d'enum Postgres), texte mis en forme exact, alerte du second passage reportée, relance sans doublon |
 
 Deux règles apprises en les écrivant, à respecter pour en ajouter :
 
@@ -653,6 +712,7 @@ make fmt              # ruff format + check --fix
 make revision M="..." # génère une migration
 make psql             # console Postgres
 make reindex          # reconstruit l'index ES depuis Postgres
+make normalize DOCUMENT=<id>  # met en forme un document déjà transcrit, sans OCR
 make logs S=api       # suit les logs d'un service
 make reset            # DESTRUCTIF — supprime les volumes (demande confirmation)
 ```

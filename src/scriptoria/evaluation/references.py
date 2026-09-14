@@ -45,6 +45,27 @@ def derniere_revision(
     return max(candidates, key=lambda revision: revision["revision"])["content_markdown"]
 
 
+# De la plus travaillée à la plus brute : la mise en forme ne change aucune lettre de l'OCR.
+LECTURES_AUTOMATIQUES = ("normalized", "ocr")
+
+
+def derniere_lecture_automatique(
+    revisions: Sequence[Mapping[str, Any]],
+) -> tuple[str, str] | None:
+    """Ce que l'évaluation mesure : `(texte, origine)` de la dernière lecture de la machine.
+
+    La mise en forme si la page en a une, sinon la sortie brute de l'OCR. La mise en
+    forme ne change aucune lettre ni aucun chiffre : la mesurer, c'est mesurer le
+    texte que le relecteur a sous les yeux, sans compter pour erreurs des césures
+    et des numéros de page qu'elle a déjà réglés. Une relecture humaine n'est jamais
+    mesurée comme une sortie de la machine.
+    """
+    for origine in LECTURES_AUTOMATIQUES:
+        if (texte := derniere_revision(revisions, origine=origine)) is not None:
+            return texte, origine
+    return None
+
+
 def fusionner_references(
     saisies: Mapping[int, str], relectures: Mapping[int, str]
 ) -> Mapping[int, Reference]:

@@ -63,6 +63,11 @@ SCORE_RAGGED_ROW = 0.4
 # Une divergence qui porte sur des chiffres est grave même quand les deux
 # passages sont textuellement presque identiques : c'est tout le propos ici.
 SCORE_NUMERIC_DIVERGENCE = 0.2
+# Tiret de fin de ligne que la mise en forme n'a pas su juger (`ma-⏎risés`) : aucun
+# caractère n'est faux, mais un mot est peut-être resté coupé. Un doute léger, au-dessus
+# d'une cellule vide — mais **sous** le seuil d'alerte de l'UI (`SEUIL_ALERTE`, 0,5
+# exclu) : à 0,5 pile, le doute était enregistré et jamais montré (vu le 2026-09-14).
+SCORE_UNCERTAIN_LINE_BREAK = 0.45
 
 # Un centime d'écart est un arrondi de facturation, pas une erreur de lecture.
 ABSOLUTE_TOLERANCE = Decimal("0.02")
